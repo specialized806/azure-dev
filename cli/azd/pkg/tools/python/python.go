@@ -6,26 +6,27 @@ package python
 import (
 	"context"
 	"fmt"
-	"path"
+	"log"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 	"github.com/blang/semver/v4"
 )
 
-type PythonCli struct {
+type Cli struct {
 	commandRunner exec.CommandRunner
 }
 
-func NewPythonCli(commandRunner exec.CommandRunner) *PythonCli {
-	return &PythonCli{
+func NewCli(commandRunner exec.CommandRunner) *Cli {
+	return &Cli{
 		commandRunner: commandRunner,
 	}
 }
 
-func (cli *PythonCli) versionInfo() tools.VersionInfo {
+func (cli *Cli) versionInfo() tools.VersionInfo {
 	return tools.VersionInfo{
 		MinimumVersion: semver.Version{
 			Major: 3,
@@ -35,78 +36,49 @@ func (cli *PythonCli) versionInfo() tools.VersionInfo {
 	}
 }
 
-func (cli *PythonCli) CheckInstalled(ctx context.Context) (bool, error) {
-	pyString, found, err := checkPath()
-	if !found {
-		return false, err
-	}
-	pythonRes, err := tools.ExecuteCommand(ctx, cli.commandRunner, pyString, "--version")
-	if err != nil {
-		return false, fmt.Errorf("checking %s version: %w", cli.Name(), err)
-	}
-	pythonSemver, err := tools.ExtractVersion(pythonRes)
-	if err != nil {
-		return false, fmt.Errorf("converting to semver version fails: %w", err)
-	}
-	updateDetail := cli.versionInfo()
-	if pythonSemver.LT(updateDetail.MinimumVersion) {
-		return false, &tools.ErrSemver{ToolName: cli.Name(), VersionInfo: updateDetail}
-	}
-	return true, nil
-}
-
-func (cli *PythonCli) InstallUrl() string {
-	return "https://wiki.python.org/moin/BeginnersGuide/Download"
-}
-
-func (cli *PythonCli) Name() string {
-	return "Python CLI"
-}
-
-func (cli *PythonCli) InstallRequirements(ctx context.Context, workingDir, environment, requirementFile string) error {
-	var res exec.RunResult
-	var err error
-
-	pyString, _, err := checkPath()
+func (cli *Cli) CheckInstalled(ctx context.Context) error {
+	pyString, err := checkPath()
 	if err != nil {
 		return err
 	}
-
-	if runtime.GOOS == "windows" {
-		// Unfortunately neither cmd.exe, nor PowerShell provide a straightforward way to use a script
-		// to modify environment for command(s) in a command list.
-		// So we are going to cheat and replicate the core functionality of Python venv scripts here,
-		// which boils down to setting VIRTUAL_ENV environment variable.
-		absWorkingDir, pathErr := filepath.Abs(workingDir)
-		if pathErr != nil {
-			return pathErr
-		}
-
-		vEnvSetting := fmt.Sprintf("VIRTUAL_ENV=%s", path.Join(absWorkingDir, environment))
-
-		runArgs := exec.
-			NewRunArgs(pyString, "-m", "pip", "install", "-r", requirementFile).
-			WithCwd(workingDir).
-			WithEnv([]string{vEnvSetting})
-
-		res, err = cli.commandRunner.Run(ctx, runArgs)
-	} else {
-		envActivation := ". " + path.Join(environment, "bin", "activate")
-		installCmd := fmt.Sprintf("%s -m pip install -r %s", pyString, requirementFile)
-		commands := []string{envActivation, installCmd}
-
-		runArgs := exec.NewRunArgs("").WithCwd(workingDir)
-		res, err = cli.commandRunner.RunList(ctx, commands, runArgs)
+	pythonRes, err := tools.ExecuteCommand(ctx, cli.commandRunner, pyString, "--version")
+	if err != nil {
+		return fmt.Errorf("checking %s version: %w", cli.Name(), err)
 	}
 
+	log.Printf("python version: %s", pythonRes)
+
+	pythonSemver, err := tools.ExtractVersion(pythonRes)
 	if err != nil {
-		return fmt.Errorf("failed to install requirements for project '%s': %w (%s)", workingDir, err, res.String())
+		return fmt.Errorf("converting to semver version fails: %w", err)
+	}
+	updateDetail := cli.versionInfo()
+	if pythonSemver.LT(updateDetail.MinimumVersion) {
+		return &tools.ErrSemver{ToolName: cli.Name(), VersionInfo: updateDetail}
 	}
 	return nil
 }
 
-func (cli *PythonCli) CreateVirtualEnv(ctx context.Context, workingDir, name string) error {
-	pyString, _, err := checkPath()
+func (cli *Cli) InstallUrl() string {
+	return "https://wiki.python.org/moin/BeginnersGuide/Download"
+}
+
+func (cli *Cli) Name() string {
+	return "Python CLI"
+}
+
+func (cli *Cli) InstallRequirements(ctx context.Context, workingDir, environment, requirementFile string) error {
+	args := []string{"-m", "pip", "install", "-r", requirementFile}
+	_, err := cli.Run(ctx, workingDir, environment, args...)
+	if err != nil {
+		return fmt.Errorf("failed to install requirements for project '%s': %w", workingDir, err)
+	}
+
+	return nil
+}
+
+func (cli *Cli) CreateVirtualEnv(ctx context.Context, workingDir, name string) error {
+	pyString, err := checkPath()
 	if err != nil {
 		return err
 	}
@@ -115,37 +87,68 @@ func (cli *PythonCli) CreateVirtualEnv(ctx context.Context, workingDir, name str
 		NewRunArgs(pyString, "-m", "venv", name).
 		WithCwd(workingDir)
 
-	res, err := cli.commandRunner.Run(ctx, runArgs)
+	_, err = cli.commandRunner.Run(ctx, runArgs)
 
 	if err != nil {
 		return fmt.Errorf(
-			"failed to create virtual Python environment for project '%s': %w (%s)",
+			"failed to create virtual Python environment for project '%s': %w",
 			workingDir,
-			err,
-			res.String(),
-		)
+			err)
 	}
 	return nil
 }
 
-func checkPath() (pyString string, found bool, err error) {
+func (cli *Cli) Run(
+	ctx context.Context,
+	workingDir string,
+	environment string,
+	args ...string,
+) (*exec.RunResult, error) {
+	pyString, err := checkPath()
+	if err != nil {
+		return nil, err
+	}
+
+	var envActivationCmd string
+
+	// Windows & Posix have different activation scripts
+	if runtime.GOOS == "windows" {
+		envActivationCmd = filepath.Join(environment, "Scripts", "activate")
+	} else {
+		envActivationCmd = ". " + filepath.Join(environment, "bin", "activate")
+	}
+
+	runCmd := strings.Join(append([]string{pyString}, args...), " ")
+	// We need to ensure the virtual environment is activated before running the script
+	commands := []string{envActivationCmd, runCmd}
+	runArgs := exec.NewRunArgs("").WithCwd(workingDir)
+	runResult, err := cli.commandRunner.RunList(ctx, commands, runArgs)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to run Python script: %w", err)
+	}
+
+	return &runResult, nil
+}
+
+func checkPath() (pyString string, err error) {
 	if runtime.GOOS == "windows" {
 		// py for https://peps.python.org/pep-0397
 		// order is important. we want to resolve 'py', if available, first
 		pyString := [2]string{"py", "python"}
 
 		for _, py := range pyString {
-			found, err = tools.ToolInPath(py)
-			if found && err == nil {
-				return py, found, nil
+			err = tools.ToolInPath(py)
+			if err == nil {
+				return py, nil
 			}
 		}
-		return "", found, err
+		return "", err
 	} else {
-		found, err := tools.ToolInPath("python3")
-		if found && err == nil {
-			return "python3", found, err
+		err := tools.ToolInPath("python3")
+		if err == nil {
+			return "python3", err
 		}
-		return "", found, err
+		return "", err
 	}
 }

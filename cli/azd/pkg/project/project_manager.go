@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
 package project
 
 import (
@@ -6,6 +9,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/ext"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
@@ -32,8 +37,6 @@ type ProjectManager interface {
 	// The initialization process will instantiate the framework & service target associated
 	// with the service config that enables the scenario for these components to add event
 	// handlers to participate in the lifecycle of an azd project
-	//
-	// The initialization process will also ensure that all required tools are installed
 	Initialize(ctx context.Context, projectConfig *ProjectConfig) error
 
 	// Returns the default service name to target based on the current working directory.
@@ -53,6 +56,11 @@ type ProjectManager interface {
 
 	// Ensures that all required service target tools are installed for the project and all child services
 	EnsureServiceTargetTools(ctx context.Context, projectConfig *ProjectConfig, serviceFilterFn ServiceFilterPredicate) error
+
+	// Ensures that all required tools for restore are installed for the project and all child services. This is like
+	// EnsureFrameworkTools but treats docker projects differently - it requires the tools for the inner project (i.e. npm)
+	// instead of needing docker tools themselves, since when doing a project restore, docker is not invoked.
+	EnsureRestoreTools(ctx context.Context, projectConfig *ProjectConfig, serviceFilterFn ServiceFilterPredicate) error
 }
 
 // ServiceFilterPredicate is a function that can be used to filter services that match a given criteria
@@ -61,38 +69,40 @@ type ServiceFilterPredicate func(svc *ServiceConfig) bool
 type projectManager struct {
 	azdContext     *azdcontext.AzdContext
 	serviceManager ServiceManager
+	importManager  *ImportManager
 }
 
 // NewProjectManager creates a new instance of the ProjectManager
 func NewProjectManager(
 	azdContext *azdcontext.AzdContext,
 	serviceManager ServiceManager,
+	importManager *ImportManager,
 ) ProjectManager {
 	return &projectManager{
 		azdContext:     azdContext,
 		serviceManager: serviceManager,
+		importManager:  importManager,
 	}
 }
 
 // Initializes the project and all child services defined within the project configuration
 func (pm *projectManager) Initialize(ctx context.Context, projectConfig *ProjectConfig) error {
-	var projectTools []tools.ExternalTool
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return err
+	}
 
-	for _, svc := range projectConfig.Services {
+	serviceTargets := make([]string, 0, len(servicesStable))
+	for _, svc := range servicesStable {
+		serviceTargets = append(serviceTargets, string(svc.Host))
+	}
+
+	tracing.SetUsageAttributes(fields.ProjectServiceTargetsKey.StringSlice(serviceTargets))
+
+	for _, svc := range servicesStable {
 		if err := pm.serviceManager.Initialize(ctx, svc); err != nil {
 			return fmt.Errorf("initializing service '%s', %w", svc.Name, err)
 		}
-
-		svcTools, err := pm.serviceManager.GetRequiredTools(ctx, svc)
-		if err != nil {
-			return fmt.Errorf("getting service required tools: %w", err)
-		}
-
-		projectTools = append(projectTools, svcTools...)
-	}
-
-	if err := tools.EnsureInstalled(ctx, tools.Unique(projectTools)...); err != nil {
-		return err
 	}
 
 	return nil
@@ -112,7 +122,12 @@ func (pm *projectManager) DefaultServiceFromWd(
 		return nil, nil
 	}
 
-	for _, svcConfig := range projectConfig.Services {
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, svcConfig := range servicesStable {
 		if wd == svcConfig.Path() {
 			return svcConfig, nil
 		}
@@ -128,7 +143,12 @@ func (pm *projectManager) EnsureAllTools(
 ) error {
 	var projectTools []tools.ExternalTool
 
-	for _, svc := range projectConfig.Services {
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return err
+	}
+
+	for _, svc := range servicesStable {
 		if serviceFilterFn != nil && !serviceFilterFn(svc) {
 			continue
 		}
@@ -155,7 +175,12 @@ func (pm *projectManager) EnsureFrameworkTools(
 ) error {
 	var requiredTools []tools.ExternalTool
 
-	for _, svc := range projectConfig.Services {
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return err
+	}
+
+	for _, svc := range servicesStable {
 		if serviceFilterFn != nil && !serviceFilterFn(svc) {
 			continue
 		}
@@ -165,11 +190,7 @@ func (pm *projectManager) EnsureFrameworkTools(
 			return fmt.Errorf("getting framework service: %w", err)
 		}
 
-		frameworkTools := frameworkService.RequiredExternalTools(ctx)
-		if err != nil {
-			return fmt.Errorf("getting service required tools: %w", err)
-		}
-
+		frameworkTools := frameworkService.RequiredExternalTools(ctx, svc)
 		requiredTools = append(requiredTools, frameworkTools...)
 	}
 
@@ -187,7 +208,12 @@ func (pm *projectManager) EnsureServiceTargetTools(
 ) error {
 	var requiredTools []tools.ExternalTool
 
-	for _, svc := range projectConfig.Services {
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return err
+	}
+
+	for _, svc := range servicesStable {
 		if serviceFilterFn != nil && !serviceFilterFn(svc) {
 			continue
 		}
@@ -197,12 +223,47 @@ func (pm *projectManager) EnsureServiceTargetTools(
 			return fmt.Errorf("getting service target: %w", err)
 		}
 
-		serviceTargetTools := serviceTarget.RequiredExternalTools(ctx)
-		if err != nil {
-			return fmt.Errorf("getting service required tools: %w", err)
+		serviceTargetTools := serviceTarget.RequiredExternalTools(ctx, svc)
+		requiredTools = append(requiredTools, serviceTargetTools...)
+	}
+
+	if err := tools.EnsureInstalled(ctx, tools.Unique(requiredTools)...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (pm *projectManager) EnsureRestoreTools(
+	ctx context.Context,
+	projectConfig *ProjectConfig,
+	serviceFilterFn ServiceFilterPredicate,
+) error {
+	var requiredTools []tools.ExternalTool
+
+	servicesStable, err := pm.importManager.ServiceStable(ctx, projectConfig)
+	if err != nil {
+		return err
+	}
+
+	for _, svc := range servicesStable {
+		if serviceFilterFn != nil && !serviceFilterFn(svc) {
+			continue
 		}
 
-		requiredTools = append(requiredTools, serviceTargetTools...)
+		frameworkService, err := pm.serviceManager.GetFrameworkService(ctx, svc)
+		if err != nil {
+			return fmt.Errorf("getting framework service: %w", err)
+		}
+
+		var frameworkTools []tools.ExternalTool
+		if dp, ok := frameworkService.(*dockerProject); ok {
+			frameworkTools = dp.framework.RequiredExternalTools(ctx, svc)
+		} else {
+			frameworkTools = frameworkService.RequiredExternalTools(ctx, svc)
+		}
+
+		requiredTools = append(requiredTools, frameworkTools...)
 	}
 
 	if err := tools.EnsureInstalled(ctx, tools.Unique(requiredTools)...); err != nil {

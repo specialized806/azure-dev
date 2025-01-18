@@ -9,9 +9,10 @@ import { DotEnvTaskProvider } from './tasks/dotEnvTaskProvider';
 import { TelemetryId } from './telemetry/telemetryId';
 import { scheduleSurveys } from './telemetry/surveyScheduler';
 import { ActivityStatisticsService } from './telemetry/activityStatisticsService';
-import { scheduleAzdSignInCheck, scheduleAzdVersionCheck, scheduleAzdYamlCheck } from './utils/azureDevCli';
+import { LoginStatus, getAzdLoginStatus, scheduleAzdSignInCheck, scheduleAzdVersionCheck, scheduleAzdYamlCheck } from './utils/azureDevCli';
 import { activeSurveys } from './telemetry/activeSurveys';
 import { scheduleRegisterWorkspaceComponents } from './views/workspace/scheduleRegisterWorkspaceComponents';
+import { registerLanguageFeatures } from './language/languageFeatures';
 
 type LoadStats = {
     // Both are the values returned by Date.now()==milliseconds since Unix epoch.
@@ -19,12 +20,19 @@ type LoadStats = {
     loadEndTime: number | undefined
 };
 
-export async function activateInternal(vscodeCtx: vscode.ExtensionContext, loadStats: LoadStats) {
+interface AzdExtensionApi {
+    /**
+     * @deprecated This is only temporary and should not be relied on.
+     */
+    getAzdLoginStatus(): Promise<LoginStatus | undefined>
+}
+
+export async function activateInternal(vscodeCtx: vscode.ExtensionContext, loadStats: LoadStats): Promise<AzdExtensionApi> {
     loadStats.loadEndTime = Date.now();
 
     function registerDisposable<T extends vscode.Disposable>(disposable: T): T {
         vscodeCtx.subscriptions.push(disposable);
-        
+
         return disposable;
     }
 
@@ -33,7 +41,7 @@ export async function activateInternal(vscodeCtx: vscode.ExtensionContext, loadS
     ext.ignoreBundle = false;
     ext.outputChannel = registerDisposable(createAzExtOutputChannel('Azure Developer', "azure-dev"));
     registerUIExtensionVariables(ext);
-    
+
     await callWithTelemetryAndErrorHandling(TelemetryId.Activation, async (activationCtx: IActionContext) => {
         activationCtx.errorHandling.rethrow = true;
         activationCtx.telemetry.properties.isActivationEvent = 'true';
@@ -46,12 +54,17 @@ export async function activateInternal(vscodeCtx: vscode.ExtensionContext, loadS
         ext.activitySvc = new ActivityStatisticsService(vscodeCtx.globalState);
         registerCommands();
         registerDisposable(vscode.tasks.registerTaskProvider('dotenv', new DotEnvTaskProvider()));
+        registerLanguageFeatures();
         scheduleRegisterWorkspaceComponents(vscodeCtx);
         scheduleSurveys(vscodeCtx.globalState, activeSurveys);
         scheduleAzdVersionCheck(); // Temporary
         scheduleAzdSignInCheck();
         scheduleAzdYamlCheck();
     });
+
+    return {
+        getAzdLoginStatus
+    };
 }
 
 export async function deactivateInternal(): Promise<void> {

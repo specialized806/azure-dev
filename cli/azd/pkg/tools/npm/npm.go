@@ -12,82 +12,76 @@ import (
 	"github.com/blang/semver/v4"
 )
 
-type NpmCli interface {
-	tools.ExternalTool
-	Install(ctx context.Context, project string) error
-	RunScript(ctx context.Context, projectPath string, scriptName string, env []string) error
-	Prune(ctx context.Context, projectPath string, production bool) error
-}
+var _ tools.ExternalTool = (*Cli)(nil)
 
-type npmCli struct {
+type Cli struct {
 	commandRunner exec.CommandRunner
 }
 
-func NewNpmCli(commandRunner exec.CommandRunner) NpmCli {
-	return &npmCli{
+func NewCli(commandRunner exec.CommandRunner) *Cli {
+	return &Cli{
 		commandRunner: commandRunner,
 	}
 }
 
-func (cli *npmCli) versionInfoNode() tools.VersionInfo {
+func (cli *Cli) versionInfoNode() tools.VersionInfo {
 	return tools.VersionInfo{
 		MinimumVersion: semver.Version{
-			Major: 16,
+			Major: 18,
 			Minor: 0,
 			Patch: 0},
 		UpdateCommand: "Visit https://nodejs.org/en/ to upgrade",
 	}
 }
 
-func (cli *npmCli) CheckInstalled(ctx context.Context) (bool, error) {
-	found, err := tools.ToolInPath("npm")
-	if !found {
-		return false, err
+func (cli *Cli) CheckInstalled(ctx context.Context) error {
+	err := tools.ToolInPath("npm")
+	if err != nil {
+		return err
 	}
 
 	//check node version
 	nodeRes, err := tools.ExecuteCommand(ctx, cli.commandRunner, "node", "--version")
 	if err != nil {
-		return false, fmt.Errorf("checking %s version: %w", cli.Name(), err)
+		return fmt.Errorf("checking %s version: %w", cli.Name(), err)
 	}
 	nodeSemver, err := tools.ExtractVersion(nodeRes)
 	if err != nil {
-		return false, fmt.Errorf("converting to semver version fails: %w", err)
+		return fmt.Errorf("converting to semver version fails: %w", err)
 	}
 	updateDetailNode := cli.versionInfoNode()
 	if nodeSemver.Compare(updateDetailNode.MinimumVersion) == -1 {
-		return false, &tools.ErrSemver{ToolName: "Node.js", VersionInfo: updateDetailNode}
+		return &tools.ErrSemver{ToolName: "Node.js", VersionInfo: updateDetailNode}
 	}
 
-	return true, nil
+	return nil
 }
 
-func (cli *npmCli) InstallUrl() string {
+func (cli *Cli) InstallUrl() string {
 	return "https://nodejs.org/"
 }
 
-func (cli *npmCli) Name() string {
+func (cli *Cli) Name() string {
 	return "npm CLI"
 }
 
-func (cli *npmCli) Install(ctx context.Context, project string) error {
+func (cli *Cli) Install(ctx context.Context, project string) error {
 	runArgs := exec.
 		NewRunArgs("npm", "install").
 		WithCwd(project)
 
-	res, err := cli.commandRunner.Run(ctx, runArgs)
+	_, err := cli.commandRunner.Run(ctx, runArgs)
 
 	if err != nil {
-		return fmt.Errorf("failed to install project %s, %s: %w", project, res.String(), err)
+		return fmt.Errorf("failed to install project %s: %w", project, err)
 	}
 	return nil
 }
 
-func (cli *npmCli) RunScript(ctx context.Context, projectPath string, scriptName string, env []string) error {
+func (cli *Cli) RunScript(ctx context.Context, projectPath string, scriptName string) error {
 	runArgs := exec.
 		NewRunArgs("npm", "run", scriptName, "--if-present").
-		WithCwd(projectPath).
-		WithEnv(env)
+		WithCwd(projectPath)
 
 	_, err := cli.commandRunner.Run(ctx, runArgs)
 
@@ -98,7 +92,7 @@ func (cli *npmCli) RunScript(ctx context.Context, projectPath string, scriptName
 	return nil
 }
 
-func (cli *npmCli) Prune(ctx context.Context, projectPath string, production bool) error {
+func (cli *Cli) Prune(ctx context.Context, projectPath string, production bool) error {
 	runArgs := exec.
 		NewRunArgs("npm", "prune").
 		WithCwd(projectPath)

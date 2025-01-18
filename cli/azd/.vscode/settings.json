@@ -8,4 +8,9 @@
     "go.lintOnSave": "package",
     "go.lintTool": "golangci-lint",
     "go.testTimeout": "10m",
+    "files.associations": {
+        "*.bicept": "go-template",
+        "*.yamlt": "go-template",
+        "*.ymlt": "go-template"
+    }
 }

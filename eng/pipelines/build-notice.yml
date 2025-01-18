@@ -44,7 +44,7 @@ jobs:
           BuildOutputName: azd
         Mac:
           Pool: Azure Pipelines
-          OSVmImage: macOS-11
+          OSVmImage: macOS-latest
           BuildTarget: azd-darwin-amd64
           BuildOutputName: azd
     pool:
@@ -90,14 +90,14 @@ jobs:
           OSVmImage:  MMSUbuntu20.04
         Mac:
           Pool: Azure Pipelines
-          OSVmImage: macOS-11
+          OSVmImage: macOS-latest
 
     pool:
       name: $(Pool)
       vmImage: $(OSVmImage)
 
     variables:
-      NodeVersion: 14.x
+      NodeVersion: 18.x
 
     steps:
       - task: NodeTool@0
@@ -112,32 +112,6 @@ jobs:
       - pwsh: ./ci-package.ps1
         workingDirectory: ext/vscode
         displayName: Package
-
-      - task: ComponentGovernanceComponentDetection@0
-
-  - job: BuildScanContainer
-    dependsOn: BuildCli
-    pool:
-      name: azsdk-pool-mms-ubuntu-2004-general
-      OSVmImage: MMSUbuntu20.04
-
-    variables:
-      ContainerName: azure-dev:cg-scan
-
-    steps:
-      - checkout: self
-      - task: DownloadPipelineArtifact@2
-        inputs:
-          artifact: azd-linux-amd64
-          path: cli/bin
-
-      - bash: |
-          docker build . -t $(ContainerName) -f cli/Dockerfile
-        displayName: Build container
-
-      - task: ComponentGovernanceComponentDetection@0
-        inputs:
-          dockerImagesToScan: $(ContainerName)
 
       - task: ComponentGovernanceComponentDetection@0
 

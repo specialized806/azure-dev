@@ -3,16 +3,35 @@
 name: todo-nodejs-mongo-aks
 metadata:
   template: todo-nodejs-mongo-aks@0.0.1-beta
+workflows:
+  up: 
+    steps:
+      - azd: provision
+      - azd: deploy --all
+pipeline:
+  variables:
+    - AZURE_PRINCIPAL_TYPE
 services:
   web:
     project: ../../web/react-fluent
-    dist: build
+    dist: dist
     language: js
     host: aks
     hooks:
-      postdeploy:
-        shell: sh
-        run: azd env set REACT_APP_WEB_BASE_URL ${SERVICE_WEB_ENDPOINT_URL}
+      prebuild:
+        windows:
+          shell: pwsh
+          run: 'echo "VITE_API_BASE_URL=""$env:SERVICE_API_ENDPOINT_URL""" > .env.local ; echo "VITE_APPLICATIONINSIGHTS_CONNECTION_STRING=""$env:APPLICATIONINSIGHTS_CONNECTION_STRING""" >> .env.local'
+        posix:
+          shell: sh
+          run: 'echo VITE_API_BASE_URL=\"$SERVICE_API_ENDPOINT_URL\" > .env.local && echo VITE_APPLICATIONINSIGHTS_CONNECTION_STRING=\"$APPLICATIONINSIGHTS_CONNECTION_STRING\" >> .env.local'
+      postbuild:
+        windows:
+          shell: pwsh
+          run: "rm .env.local"
+        posix:
+          shell: sh
+          run: "rm .env.local"
   api:
     project: ../../api/js
     language: js
@@ -20,7 +39,3 @@ services:
     k8s:
       ingress:
         relativePath: api
-    hooks:
-      postdeploy:
-        shell: sh
-        run: azd env set REACT_APP_API_BASE_URL ${SERVICE_API_ENDPOINT_URL}

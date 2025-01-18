@@ -15,6 +15,7 @@ import (
 type ServiceLanguageKind string
 
 const (
+	ServiceLanguageNone       ServiceLanguageKind = ""
 	ServiceLanguageDotNet     ServiceLanguageKind = "dotnet"
 	ServiceLanguageCsharp     ServiceLanguageKind = "csharp"
 	ServiceLanguageFsharp     ServiceLanguageKind = "fsharp"
@@ -23,6 +24,7 @@ const (
 	ServiceLanguagePython     ServiceLanguageKind = "python"
 	ServiceLanguageJava       ServiceLanguageKind = "java"
 	ServiceLanguageDocker     ServiceLanguageKind = "docker"
+	ServiceLanguageSwa        ServiceLanguageKind = "swa"
 )
 
 func parseServiceLanguage(kind ServiceLanguageKind) (ServiceLanguageKind, error) {
@@ -32,18 +34,20 @@ func parseServiceLanguage(kind ServiceLanguageKind) (ServiceLanguageKind, error)
 	}
 
 	switch kind {
-	case ServiceLanguageDotNet,
+	case ServiceLanguageNone,
+		ServiceLanguageDotNet,
 		ServiceLanguageCsharp,
 		ServiceLanguageFsharp,
 		ServiceLanguageJavaScript,
 		ServiceLanguageTypeScript,
 		ServiceLanguagePython,
 		ServiceLanguageJava:
-		// Excluding ServiceLanguageDocker since it is implicitly derived currently, and not an actual language
+		// Excluding ServiceLanguageDocker and ServiceLanguageSwa since it is implicitly derived currently,
+		// and not an actual language
 		return kind, nil
 	}
 
-	return ServiceLanguageKind(""), fmt.Errorf("unsupported language '%s'", kind)
+	return ServiceLanguageKind("Unsupported"), fmt.Errorf("unsupported language '%s'", kind)
 }
 
 type FrameworkRequirements struct {
@@ -60,7 +64,7 @@ type FrameworkPackageRequirements struct {
 // restore and build commands
 type FrameworkService interface {
 	// Gets a list of the required external tools for the framework service
-	RequiredExternalTools(ctx context.Context) []tools.ExternalTool
+	RequiredExternalTools(ctx context.Context, serviceConfig *ServiceConfig) []tools.ExternalTool
 
 	// Initializes the framework service for the specified service configuration
 	// This is useful if the framework needs to subscribe to any service events
@@ -75,14 +79,16 @@ type FrameworkService interface {
 	Restore(
 		ctx context.Context,
 		serviceConfig *ServiceConfig,
-	) *async.TaskWithProgress[*ServiceRestoreResult, ServiceProgress]
+		progress *async.Progress[ServiceProgress],
+	) (*ServiceRestoreResult, error)
 
 	// Builds the source for the framework service
 	Build(
 		ctx context.Context,
 		serviceConfig *ServiceConfig,
 		restoreOutput *ServiceRestoreResult,
-	) *async.TaskWithProgress[*ServiceBuildResult, ServiceProgress]
+		progress *async.Progress[ServiceProgress],
+	) (*ServiceBuildResult, error)
 
 	// Packages the source suitable for deployment
 	// This may optionally perform a rebuild internally depending on the language/framework requirements
@@ -90,7 +96,8 @@ type FrameworkService interface {
 		ctx context.Context,
 		serviceConfig *ServiceConfig,
 		buildOutput *ServiceBuildResult,
-	) *async.TaskWithProgress[*ServicePackageResult, ServiceProgress]
+		progress *async.Progress[ServiceProgress],
+	) (*ServicePackageResult, error)
 }
 
 // CompositeFrameworkService is a framework service that requires a nested
@@ -108,9 +115,13 @@ func validatePackageOutput(packagePath string) error {
 		return fmt.Errorf("package output '%s' does not exist, %w", packagePath, err)
 	} else if err != nil {
 		return fmt.Errorf("failed to read package output '%s', %w", packagePath, err)
-	} else if err == nil && len(entries) == 0 {
+	} else if len(entries) == 0 {
 		return fmt.Errorf("package output '%s' is empty", packagePath)
 	}
 
 	return nil
+}
+
+func (slk ServiceLanguageKind) IsDotNet() bool {
+	return slk == ServiceLanguageDotNet || slk == ServiceLanguageCsharp || slk == ServiceLanguageFsharp
 }

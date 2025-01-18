@@ -7,93 +7,117 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/MakeNowJust/heredoc/v2"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/lazy"
 	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
+	"github.com/azure/azure-dev/cli/azd/pkg/platform"
 	"github.com/azure/azure-dev/cli/azd/pkg/project"
+	"github.com/azure/azure-dev/cli/azd/pkg/templates"
+	"github.com/azure/azure-dev/cli/azd/pkg/tools/dotnet"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools/git"
+	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockenv"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockexec"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockinput"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
+type testCase struct {
+	name        string
+	templateDir string
+	// Files that will be mocked to be executable when fetched remotely.
+	// Equally, these files are asserted to be executable after init.
+	executableFiles []string
+}
+
 func Test_Initializer_Initialize(t *testing.T) {
-	tests := []struct {
-		name        string
-		templateDir string
-		// Files that will be mocked to be executable when fetched remotely.
-		// Equally, these files are asserted to be executable after init.
-		executableFiles []string
-	}{
+	tests := []testCase{
 		{"RegularTemplate", "template", []string{"script/test.sh"}},
 		{"MinimalTemplate", "template-minimal", []string{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			projectDir := t.TempDir()
-			ctx := context.Background()
 			azdCtx := azdcontext.NewAzdContextWithDirectory(projectDir)
-			console := mockinput.NewMockConsole()
-			realRunner := exec.NewCommandRunner(os.Stdin, os.Stdout, os.Stderr)
-			mockRunner := mockexec.NewMockCommandRunner()
-			mockRunner.When(func(args exec.RunArgs, command string) bool { return true }).
-				RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
-					// Stub out git clone, otherwise run actual command
-					if slices.Contains(args.Args, "clone") && slices.Contains(args.Args, "local") {
-						stagingDir := args.Args[len(args.Args)-1]
-						copyTemplate(t, testDataPath(tt.templateDir), stagingDir)
+			mockContext := mocks.NewMockContext(context.Background())
+			mockGitClone(t, mockContext, "https://github.com/Azure-Samples/local", tt)
 
-						gitArgs := exec.NewRunArgs("git", "-C", stagingDir).WithEnrichError(true)
+			mockEnv := &mockenv.MockEnvManager{}
+			mockEnv.On("Save", mock.Anything, mock.Anything).Return(nil)
 
-						// Mock clone by creating a git repository locally
-						_, err := realRunner.Run(ctx, gitArgs.AppendParams("init"))
-						require.NoError(t, err)
-
-						_, err = realRunner.Run(ctx, gitArgs.AppendParams("add", "*"))
-						require.NoError(t, err)
-
-						for _, file := range tt.executableFiles {
-							_, err = realRunner.Run(
-								ctx,
-								gitArgs.AppendParams("update-index", "--chmod=+x", file))
-							require.NoError(t, err)
-
-							// Mocks the correct behavior in *nix when the file lands on the filesystem.
-							// git would have automatically set the correct file executable permissions.
-							//
-							// Note that `git update-index --chmod=+x` simply updates the tracked permissions in git,
-							// but does not update the files directly, hence this is needed.
-							if runtime.GOOS != "windows" {
-								err = os.Chmod(filepath.Join(stagingDir, file), 0755)
-								require.NoError(t, err)
-							}
-						}
-
-						return exec.NewRunResult(0, "", ""), nil
-					}
-
-					return realRunner.Run(ctx, args)
-				})
-
-			i := NewInitializer(console, git.NewGitCli(mockRunner))
-			err := i.Initialize(ctx, azdCtx, "local", "")
+			i := NewInitializer(
+				mockContext.Console,
+				git.NewCli(mockContext.CommandRunner),
+				dotnet.NewCli(mockContext.CommandRunner),
+				mockContext.AlphaFeaturesManager,
+				lazy.From[environment.Manager](mockEnv),
+			)
+			err := i.Initialize(*mockContext.Context, azdCtx, &templates.Template{RepositoryPath: "local"}, "")
 			require.NoError(t, err)
 
 			verifyTemplateCopied(t, testDataPath(tt.templateDir), projectDir, verifyOptions{})
-			verifyExecutableFilePermissions(t, ctx, i.gitCli, projectDir, tt.executableFiles)
+			verifyExecutableFilePermissions(t, *mockContext.Context, i.gitCli, projectDir, tt.executableFiles)
 
 			require.FileExists(t, filepath.Join(projectDir, ".gitignore"))
 			require.FileExists(t, azdCtx.ProjectPath())
 			require.DirExists(t, azdCtx.EnvironmentDirectory())
 		})
 	}
+}
+
+func Test_Initializer_DevCenter(t *testing.T) {
+	projectDir := t.TempDir()
+	azdCtx := azdcontext.NewAzdContextWithDirectory(projectDir)
+	mockContext := mocks.NewMockContext(context.Background())
+	testMetadata := testCase{
+		name:        "devcenter",
+		templateDir: "template",
+	}
+	mockGitClone(t, mockContext, "https://github.com/Azure-Samples/local", testMetadata)
+
+	template := &templates.Template{
+		RepositoryPath: "local",
+		Metadata: templates.Metadata{
+			Project: map[string]string{
+				"platform.type":                         "devcenter",
+				"platform.config.name":                  "DEVCENTER_NAME",
+				"platform.config.project":               "DEVCENTER_PROJECT",
+				"platform.config.environmentDefinition": "DEVCENTER_ENV_DEFINITION",
+			},
+		},
+	}
+
+	mockEnv := &mockenv.MockEnvManager{}
+	mockEnv.On("Save", mock.Anything, mock.Anything).Return(nil)
+
+	i := NewInitializer(
+		mockContext.Console,
+		git.NewCli(mockContext.CommandRunner),
+		dotnet.NewCli(mockContext.CommandRunner),
+		mockContext.AlphaFeaturesManager,
+		lazy.From[environment.Manager](mockEnv),
+	)
+	err := i.Initialize(*mockContext.Context, azdCtx, template, "")
+	require.NoError(t, err)
+
+	prj, err := project.Load(*mockContext.Context, azdCtx.ProjectPath())
+	require.NoError(t, err)
+	require.Equal(t, prj.Platform.Type, platform.PlatformKind("devcenter"))
+	require.Equal(t, prj.Platform.Config["name"], "DEVCENTER_NAME")
+	require.Equal(t, prj.Platform.Config["project"], "DEVCENTER_PROJECT")
+	require.Equal(t, prj.Platform.Config["environmentDefinition"], "DEVCENTER_ENV_DEFINITION")
 }
 
 func Test_Initializer_InitializeWithOverwritePrompt(t *testing.T) {
@@ -128,12 +152,13 @@ func Test_Initializer_InitializeWithOverwritePrompt(t *testing.T) {
 				return strings.Contains(options.Message, "What would you like to do with these files?")
 			}).Respond(tt.selection)
 
-			realRunner := exec.NewCommandRunner(os.Stdin, os.Stdout, os.Stderr)
+			realRunner := exec.NewCommandRunner(nil)
 			mockRunner := mockexec.NewMockCommandRunner()
 			mockRunner.When(func(args exec.RunArgs, command string) bool { return true }).
 				RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
 					// Stub out git clone, otherwise run actual command
-					if slices.Contains(args.Args, "clone") && slices.Contains(args.Args, "local") {
+					if slices.Contains(args.Args, "clone") &&
+						slices.Contains(args.Args, "https://github.com/Azure-Samples/local") {
 						stagingDir := args.Args[len(args.Args)-1]
 						copyTemplate(t, testDataPath(templateDir), stagingDir)
 						_, err := realRunner.Run(context.Background(), exec.NewRunArgs("git", "-C", stagingDir, "init"))
@@ -145,8 +170,17 @@ func Test_Initializer_InitializeWithOverwritePrompt(t *testing.T) {
 					return realRunner.Run(context.Background(), args)
 				})
 
-			i := NewInitializer(console, git.NewGitCli(mockRunner))
-			err = i.Initialize(context.Background(), azdCtx, "local", "")
+			mockEnv := &mockenv.MockEnvManager{}
+			mockEnv.On("Save", mock.Anything, mock.Anything).Return(nil)
+
+			i := NewInitializer(
+				console,
+				git.NewCli(mockRunner),
+				dotnet.NewCli(mockRunner),
+				alpha.NewFeaturesManagerWithConfig(config.NewEmptyConfig()),
+				lazy.From[environment.Manager](mockEnv),
+			)
+			err = i.Initialize(context.Background(), azdCtx, &templates.Template{RepositoryPath: "local"}, "")
 			require.NoError(t, err)
 
 			switch tt.selection {
@@ -262,7 +296,7 @@ func verifyTemplateCopied(
 
 func verifyExecutableFilePermissions(t *testing.T,
 	ctx context.Context,
-	git git.GitCli,
+	git *git.Cli,
 	repoPath string,
 	expectedFiles []string) {
 	output, err := git.ListStagedFiles(ctx, repoPath)
@@ -287,7 +321,7 @@ func verifyExecutableFilePermissions(t *testing.T,
 	}
 }
 
-func Test_Initializer_InitializeEmpty(t *testing.T) {
+func Test_Initializer_WriteCoreAssets(t *testing.T) {
 	type setup struct {
 		projectFile   string
 		gitignoreFile string
@@ -341,9 +375,16 @@ func Test_Initializer_InitializeEmpty(t *testing.T) {
 			}
 
 			console := mockinput.NewMockConsole()
-			realRunner := exec.NewCommandRunner(os.Stdin, os.Stdout, os.Stderr)
-			i := NewInitializer(console, git.NewGitCli(realRunner))
-			err := i.InitializeEmpty(context.Background(), azdCtx)
+			realRunner := exec.NewCommandRunner(nil)
+
+			envManager := &mockenv.MockEnvManager{}
+			envManager.On("Save", mock.Anything, mock.Anything).Return(nil)
+
+			i := NewInitializer(
+				console, git.NewCli(realRunner), nil,
+				alpha.NewFeaturesManagerWithConfig(config.NewEmptyConfig()),
+				lazy.From[environment.Manager](envManager))
+			err := i.writeCoreAssets(context.Background(), azdCtx)
 			require.NoError(t, err)
 
 			projectFileContent := readFile(t, testDataPath("empty", tt.expected.projectFile))
@@ -402,7 +443,7 @@ func verifyFileContent(t *testing.T, file string, content string) {
 }
 
 func verifyProjectFile(t *testing.T, azdCtx *azdcontext.AzdContext, content string) {
-	content = strings.Replace(content, "<project>", azdCtx.GetDefaultProjectName(), 1)
+	content = strings.Replace(content, "<project>", azdcontext.ProjectName(azdCtx.ProjectDirectory()), 1)
 	verifyFileContent(t, azdCtx.ProjectPath(), content)
 
 	_, err := project.Load(context.Background(), azdCtx.ProjectPath())
@@ -520,4 +561,202 @@ func Test_parseExecutableFiles(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInitializer_PromptIfNonEmpty(t *testing.T) {
+	type dirSetup struct {
+		// whether the directory is a git repository
+		isGitRepo bool
+		// filenames to create in the directory before running tests
+		files []string
+	}
+	tests := []struct {
+		name        string
+		dir         dirSetup
+		userConfirm bool
+		expectedErr string
+	}{
+		{
+			"EmptyDir",
+			dirSetup{false, []string{}},
+			false,
+			"",
+		},
+		{
+			"NonEmptyDir",
+			dirSetup{false, []string{"a.txt"}},
+			true,
+			"",
+		},
+		{
+			"NonEmptyDir_Declined",
+			dirSetup{false, []string{"a.txt"}},
+			false,
+			"confirmation declined",
+		},
+		{
+			"NonEmptyGitDir",
+			dirSetup{true, []string{"a.txt"}},
+			true,
+			"",
+		},
+		{
+			"NonEmptyGitDir_Declined",
+			dirSetup{true, []string{"a.txt"}},
+			false,
+			"confirmation declined",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			console := mockinput.NewMockConsole()
+			cmdRun := mockexec.NewMockCommandRunner()
+			gitCli := git.NewCli(cmdRun)
+
+			// create files
+			for _, file := range tt.dir.files {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, file), []byte{}, 0600))
+			}
+
+			// mock git branch command
+			gitBranchImpl := cmdRun.When(func(args exec.RunArgs, command string) bool {
+				return slices.Contains(args.Args, "branch") &&
+					slices.Contains(args.Args, "--show-current")
+			})
+			if tt.dir.isGitRepo {
+				gitBranchImpl.Respond(exec.RunResult{ExitCode: 0})
+			} else {
+				gitBranchImpl.Respond(exec.RunResult{ExitCode: 128, Stderr: "fatal: not a git repository"})
+			}
+
+			// mock console input
+			console.WhenConfirm(func(options input.ConsoleOptions) bool { return true }).
+				Respond(tt.userConfirm)
+
+			i := &Initializer{
+				console: console,
+				gitCli:  gitCli,
+			}
+			azdCtx := azdcontext.NewAzdContextWithDirectory(dir)
+			err := i.PromptIfNonEmpty(context.Background(), azdCtx)
+
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestInitializer_writeFileSafe(t *testing.T) {
+	const nameNoExt = "test"
+	const ext = ".txt"
+	const name = nameNoExt + ext
+	const infix = "renamed"
+
+	type file struct {
+		path    string
+		content string
+	}
+
+	tests := []struct {
+		name     string
+		existing []file // existing files in the directory
+		args     file   // the file to write
+		expect   []file // expected files after writing
+	}{
+		{
+			name:     "Empty",
+			existing: []file{},
+			args:     file{name, "content"},
+			expect:   []file{{name, "content"}},
+		},
+		{
+			name:     "WhenExisting_Renamed",
+			existing: []file{{name, "existing"}},
+			args:     file{name, "content"},
+			expect:   []file{{name, "existing"}, {nameNoExt + infix + ext, "content"}},
+		},
+		{
+			name:     "BothExisting_NotModified",
+			existing: []file{{name, "existing"}, {nameNoExt + infix + ext, "existing2"}},
+			args:     file{name, "content"},
+			expect:   []file{{name, "existing"}, {nameNoExt + infix + ext, "existing2"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			i := Initializer{
+				console: mockinput.NewMockConsole(),
+			}
+
+			dir := t.TempDir()
+			for _, f := range tt.existing {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, f.path), []byte(f.content), osutil.PermissionFile))
+			}
+
+			err := i.writeFileSafe(
+				context.Background(),
+				filepath.Join(dir, tt.args.path),
+				infix,
+				[]byte(tt.args.content),
+				osutil.PermissionFile,
+			)
+			require.NoError(t, err)
+
+			for _, expect := range tt.expect {
+				require.FileExists(t, filepath.Join(dir, expect.path))
+				content, err := os.ReadFile(filepath.Join(dir, expect.path))
+				require.NoError(t, err)
+				require.Equal(t, expect.content, string(content))
+			}
+		})
+	}
+}
+
+func mockGitClone(t *testing.T, mockContext *mocks.MockContext, templatePath string, testCase testCase) {
+	realRunner := exec.NewCommandRunner(nil)
+
+	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool { return true }).
+		RespondFn(func(args exec.RunArgs) (exec.RunResult, error) {
+			// Stub out git clone, otherwise run actual command
+			if slices.Contains(args.Args, "clone") && slices.Contains(args.Args, templatePath) {
+				stagingDir := args.Args[len(args.Args)-1]
+				copyTemplate(t, testDataPath(testCase.templateDir), stagingDir)
+
+				gitArgs := exec.NewRunArgs("git", "-C", stagingDir)
+
+				// Mock clone by creating a git repository locally
+				_, err := realRunner.Run(*mockContext.Context, gitArgs.AppendParams("init"))
+				require.NoError(t, err)
+
+				_, err = realRunner.Run(*mockContext.Context, gitArgs.AppendParams("add", "*"))
+				require.NoError(t, err)
+
+				for _, file := range testCase.executableFiles {
+					_, err = realRunner.Run(
+						*mockContext.Context,
+						gitArgs.AppendParams("update-index", "--chmod=+x", file),
+					)
+					require.NoError(t, err)
+
+					// Mocks the correct behavior in *nix when the file lands on the filesystem.
+					// git would have automatically set the correct file executable permissions.
+					//
+					// Note that `git update-index --chmod=+x` simply updates the tracked permissions in git,
+					// but does not update the files directly, hence this is needed.
+					if runtime.GOOS != "windows" {
+						err = os.Chmod(filepath.Join(stagingDir, file), 0755)
+						require.NoError(t, err)
+					}
+				}
+
+				return exec.NewRunResult(0, "", ""), nil
+			}
+
+			return realRunner.Run(*mockContext.Context, args)
+		})
 }

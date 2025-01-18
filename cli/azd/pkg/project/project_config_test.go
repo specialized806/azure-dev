@@ -9,7 +9,12 @@ import (
 	"github.com/MakeNowJust/heredoc/v2"
 	"github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
+	"github.com/azure/azure-dev/cli/azd/pkg/ext"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/snapshot"
+	"github.com/braydonk/yaml"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,7 +79,7 @@ services:
     host: appservice
 `
 
-	e := environment.EphemeralWithValues("test-env", map[string]string{
+	e := environment.NewWithValues("test-env", map[string]string{
 		environment.SubscriptionIdEnvVarName: "SUBSCRIPTION_ID",
 	})
 
@@ -85,40 +90,13 @@ services:
 
 	require.Equal(t, "test-proj", projectConfig.Name)
 	require.Equal(t, "test-proj-template", projectConfig.Metadata.Template)
-	require.Equal(t, fmt.Sprintf("rg-%s", e.GetEnvName()), projectConfig.ResourceGroupName.MustEnvsubst(e.Getenv))
+	require.Equal(t, fmt.Sprintf("rg-%s", e.Name()), projectConfig.ResourceGroupName.MustEnvsubst(e.Getenv))
 	require.Equal(t, 2, len(projectConfig.Services))
 
 	for key, svc := range projectConfig.Services {
-		require.Equal(t, key, svc.Module)
 		require.Equal(t, key, svc.Name)
 		require.Equal(t, projectConfig, svc.Project)
 	}
-}
-
-func TestProjectConfigHasService(t *testing.T) {
-	const testProj = `
-name: test-proj
-metadata:
-  template: test-proj-template
-resourceGroup: rg-test
-services:
-  web:
-    project: src/web
-    language: js
-    host: appservice
-  api:
-    project: src/api
-    language: js
-    host: appservice
-`
-
-	mockContext := mocks.NewMockContext(context.Background())
-	projectConfig, err := Parse(*mockContext.Context, testProj)
-	require.Nil(t, err)
-
-	require.True(t, projectConfig.HasService("web"))
-	require.True(t, projectConfig.HasService("api"))
-	require.False(t, projectConfig.HasService("foobar"))
 }
 
 func TestProjectWithCustomDockerOptions(t *testing.T) {
@@ -135,6 +113,9 @@ services:
     docker:
       path: ./Dockerfile.dev
       context: ../
+      buildArgs:
+        - 'foo'
+        - 'bar'
 `
 
 	mockContext := mocks.NewMockContext(context.Background())
@@ -147,31 +128,38 @@ services:
 
 	require.Equal(t, "./Dockerfile.dev", service.Docker.Path)
 	require.Equal(t, "../", service.Docker.Context)
+	require.Equal(t, []osutil.ExpandableString{
+		osutil.NewExpandableString("foo"),
+		osutil.NewExpandableString("bar"),
+	}, service.Docker.BuildArgs)
 }
 
-func TestProjectWithCustomModule(t *testing.T) {
-	const testProj = `
-name: test-proj
-metadata:
-  template: test-proj-template
-resourceGroup: rg-test
-services:
-  api:
-    project: src/api
-    language: js
-    host: containerapp
-    module: ./api/api
-`
+func TestProjectWithExpandableDockerArgs(t *testing.T) {
+	env := environment.NewWithValues("test", map[string]string{
+		"REGISTRY": "myregistry",
+		"IMAGE":    "myimage",
+		"TAG":      "mytag",
+		"KEY1":     "val1",
+		"KEY2":     "val2",
+	})
 
-	mockContext := mocks.NewMockContext(context.Background())
-	projectConfig, err := Parse(*mockContext.Context, testProj)
+	serviceConfig := &ServiceConfig{
+		Docker: DockerProjectOptions{
+			Registry: osutil.NewExpandableString("${REGISTRY}"),
+			Image:    osutil.NewExpandableString("${IMAGE}"),
+			Tag:      osutil.NewExpandableString("${TAG}"),
+			BuildArgs: []osutil.ExpandableString{
+				osutil.NewExpandableString("key1=${KEY1}"),
+				osutil.NewExpandableString("key2=${KEY2}"),
+			},
+		},
+	}
 
-	require.NotNil(t, projectConfig)
-	require.Nil(t, err)
-
-	service := projectConfig.Services["api"]
-
-	require.Equal(t, "./api/api", service.Module)
+	require.Equal(t, env.Getenv("REGISTRY"), serviceConfig.Docker.Registry.MustEnvsubst(env.Getenv))
+	require.Equal(t, env.Getenv("IMAGE"), serviceConfig.Docker.Image.MustEnvsubst(env.Getenv))
+	require.Equal(t, env.Getenv("TAG"), serviceConfig.Docker.Tag.MustEnvsubst(env.Getenv))
+	require.Equal(t, fmt.Sprintf("key1=%s", env.Getenv("KEY1")), serviceConfig.Docker.BuildArgs[0].MustEnvsubst(env.Getenv))
+	require.Equal(t, fmt.Sprintf("key2=%s", env.Getenv("KEY2")), serviceConfig.Docker.BuildArgs[1].MustEnvsubst(env.Getenv))
 }
 
 func TestProjectConfigAddHandler(t *testing.T) {
@@ -186,10 +174,6 @@ func TestProjectConfigAddHandler(t *testing.T) {
 
 	err := project.AddHandler(ServiceEventDeploy, handler)
 	require.Nil(t, err)
-
-	// Expected error if attempting to register the same handler more than 1 time
-	err = project.AddHandler(ServiceEventDeploy, handler)
-	require.NotNil(t, err)
 
 	err = project.RaiseEvent(*mockContext.Context, ServiceEventDeploy, ProjectLifecycleEventArgs{Project: project})
 	require.Nil(t, err)
@@ -322,7 +306,6 @@ services:
     project: src/api
     language: js
     host: containerapp
-    module: ./api/api
 `
 
 	mockContext := mocks.NewMockContext(context.Background())
@@ -344,10 +327,6 @@ func TestProjectConfigRaiseEventWithoutArgs(t *testing.T) {
 
 	err := project.AddHandler(ProjectEventDeploy, handler)
 	require.Nil(t, err)
-
-	// Expected error if attempting to register the same handler more than 1 time
-	err = project.AddHandler(ProjectEventDeploy, handler)
-	require.NotNil(t, err)
 
 	err = project.RaiseEvent(ctx, ProjectEventDeploy, ProjectLifecycleEventArgs{Project: project})
 	require.Nil(t, err)
@@ -372,10 +351,6 @@ func TestProjectConfigRaiseEventWithArgs(t *testing.T) {
 	err := project.AddHandler(ProjectEventDeploy, handler)
 	require.Nil(t, err)
 
-	// Expected error if attempting to register the same handler more than 1 time
-	err = project.AddHandler(ProjectEventDeploy, handler)
-	require.NotNil(t, err)
-
 	err = project.RaiseEvent(*mockContext.Context, ProjectEventDeploy, eventArgs)
 	require.Nil(t, err)
 	require.True(t, handlerCalled)
@@ -393,14 +368,13 @@ services:
     project: src/api
     language: js
     host: containerapp
-    module: ./api/api
     `
 
 	mockContext := mocks.NewMockContext(context.Background())
 	projectConfig, err := Parse(*mockContext.Context, testProj)
 	require.NoError(t, err)
 
-	env := environment.EphemeralWithValues("", map[string]string{
+	env := environment.NewWithValues("", map[string]string{
 		"foo": "hello",
 		"bar": "goodbye",
 	})
@@ -476,4 +450,142 @@ metadata:
 		_, err = Parse(context.Background(), testProjWithoutVersion)
 		require.NoError(t, err)
 	})
+}
+
+func Test_Hooks_Config_Yaml_Marshalling(t *testing.T) {
+	t.Run("No hooks", func(t *testing.T) {
+		expected := &ProjectConfig{
+			Name: "test-proj",
+			Services: map[string]*ServiceConfig{
+				"api": {
+					Host:         ContainerAppTarget,
+					Language:     ServiceLanguageTypeScript,
+					RelativePath: "src/api",
+				},
+			},
+		}
+
+		yamlBytes, err := yaml.Marshal(expected)
+		require.NoError(t, err)
+		snapshot.SnapshotT(t, string(yamlBytes))
+
+		actual, err := Parse(context.Background(), string(yamlBytes))
+		require.NoError(t, err)
+		require.Equal(t, expected.Hooks, actual.Hooks)
+	})
+
+	t.Run("Single hooks per event", func(t *testing.T) {
+		expected := &ProjectConfig{
+			Name: "test-proj",
+			Hooks: HooksConfig{
+				"postprovision": {
+					{
+						Shell: ext.ShellTypeBash,
+						Run:   "scripts/postprovision.sh",
+					},
+				},
+			},
+			Services: map[string]*ServiceConfig{
+				"api": {
+					Host:         ContainerAppTarget,
+					Language:     ServiceLanguageTypeScript,
+					RelativePath: "src/api",
+					Hooks: HooksConfig{
+						"postprovision": {
+							{
+								Shell: ext.ShellTypeBash,
+								Run:   "scripts/postprovision.sh",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		yamlBytes, err := yaml.Marshal(expected)
+		require.NoError(t, err)
+		snapshot.SnapshotT(t, string(yamlBytes))
+
+		actual, err := Parse(context.Background(), string(yamlBytes))
+		require.NoError(t, err)
+		require.Equal(t, expected.Hooks, actual.Hooks)
+		require.Equal(t, expected.Services["api"].Hooks, actual.Services["api"].Hooks)
+	})
+
+	t.Run("Multiple hooks per event", func(t *testing.T) {
+		expected := &ProjectConfig{
+			Name: "test-proj",
+			Hooks: map[string][]*ext.HookConfig{
+				"postprovision": {
+					{
+						Shell: ext.ShellTypeBash,
+						Run:   "scripts/postprovision1.sh",
+					},
+					{
+						Shell: ext.ShellTypeBash,
+						Run:   "scripts/postprovision2.sh",
+					},
+				},
+			},
+			Services: map[string]*ServiceConfig{
+				"api": {
+					Host:         ContainerAppTarget,
+					Language:     ServiceLanguageTypeScript,
+					RelativePath: "src/api",
+					Hooks: HooksConfig{
+						"postprovision": {
+							{
+								Shell: ext.ShellTypeBash,
+								Run:   "scripts/postprovision1.sh",
+							},
+							{
+								Shell: ext.ShellTypeBash,
+								Run:   "scripts/postprovision2.sh",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		yamlBytes, err := yaml.Marshal(expected)
+		require.NoError(t, err)
+		snapshot.SnapshotT(t, string(yamlBytes))
+
+		actual, err := Parse(context.Background(), string(yamlBytes))
+		require.NoError(t, err)
+		require.Equal(t, expected.Hooks, actual.Hooks)
+		require.Equal(t, expected.Services["api"].Hooks, actual.Services["api"].Hooks)
+	})
+}
+
+func Test_Resources_Marshal_Unmarshal(t *testing.T) {
+	const doc = `
+name: test-proj
+resources:
+  api:
+    type: host.containerapp
+    port: 8080
+    env:
+    - name: FOO
+      value: BAR
+`
+
+	prj := ProjectConfig{}
+	err := yaml.Unmarshal([]byte(doc), &prj)
+	require.NoError(t, err)
+
+	marshaled, err := yaml.Marshal(prj)
+	require.NoError(t, err)
+	assert.YAMLEq(t, doc, string(marshaled))
+
+	roundTripped := ProjectConfig{}
+	err = yaml.Unmarshal(marshaled, &roundTripped)
+	require.NoError(t, err)
+
+	cap, ok := roundTripped.Resources["api"].Props.(ContainerAppProps)
+	require.True(t, ok)
+	require.Equal(t, 8080, cap.Port)
+	require.Equal(t, "FOO", cap.Env[0].Name)
+	require.Equal(t, "BAR", cap.Env[0].Value)
 }

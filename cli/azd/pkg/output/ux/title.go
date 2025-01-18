@@ -17,11 +17,17 @@ type MessageTitle struct {
 
 func (t *MessageTitle) ToString(currentIndentation string) string {
 	if t.TitleNote != "" {
+
+		// Make sure note ends with period
+		if t.TitleNote[len(t.TitleNote)-1] != '.' {
+			t.TitleNote += "."
+		}
+
 		return fmt.Sprintf("\n%s\n%s\n",
-			output.WithBold(t.Title),
-			output.WithGrayFormat(t.TitleNote))
+			output.WithBold("%s", t.Title),
+			output.WithGrayFormat("%s", t.TitleNote))
 	}
-	return fmt.Sprintf("\n%s\n", output.WithBold(t.Title))
+	return fmt.Sprintf("\n%s\n", output.WithBold("%s", t.Title))
 }
 
 func (t *MessageTitle) MarshalJSON() ([]byte, error) {

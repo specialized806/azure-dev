@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
@@ -21,12 +24,12 @@ func TestOverrideUserAgent(t *testing.T) {
 		return mocks.CreateEmptyHttpResponse(request, http.StatusOK)
 	})
 
-	clientOptions := NewClientOptionsBuilder().
-		WithTransport(mockContext.HttpClient).
-		WithPerCallPolicy(NewUserAgentPolicy(expectedUserAgent)).
-		BuildArmClientOptions()
-
-	client, err := armresources.NewClient("SUBSCRIPTION_ID", &mocks.MockCredentials{}, clientOptions)
+	client, err := armresources.NewClient("SUBSCRIPTION_ID", &mocks.MockCredentials{}, &arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			PerCallPolicies: []policy.Policy{NewUserAgentPolicy(expectedUserAgent)},
+			Transport:       mockContext.HttpClient,
+		},
+	})
 	require.NoError(t, err)
 
 	var response *http.Response

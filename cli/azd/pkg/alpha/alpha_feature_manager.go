@@ -3,9 +3,13 @@ package alpha
 import (
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/azure/azure-dev/cli/azd/internal/tracing"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/fields"
 	"github.com/azure/azure-dev/cli/azd/pkg/config"
 )
 
@@ -15,12 +19,21 @@ type FeatureManager struct {
 	userConfigCache config.Config
 	// used for mocking alpha features on testing
 	alphaFeaturesResolver func() []Feature
+	withSync              *sync.Once
 }
 
 // NewFeaturesManager creates the alpha features manager from the user configuration
 func NewFeaturesManager(configManager config.UserConfigManager) *FeatureManager {
 	return &FeatureManager{
 		configManager: configManager,
+		withSync:      &sync.Once{},
+	}
+}
+
+func NewFeaturesManagerWithConfig(config config.Config) *FeatureManager {
+	return &FeatureManager{
+		userConfigCache: config,
+		withSync:        &sync.Once{},
 	}
 }
 
@@ -51,8 +64,6 @@ func (m *FeatureManager) ListFeatures() (map[string]Feature, error) {
 	return result, nil
 }
 
-var withSync *sync.Once = &sync.Once{}
-
 func (m *FeatureManager) initConfigCache() {
 	if m.userConfigCache == nil {
 		config, err := m.configManager.Load()
@@ -66,19 +77,60 @@ func (m *FeatureManager) initConfigCache() {
 // IsEnabled search and find out if the AlphaFeatureId is currently enabled
 func (m *FeatureManager) IsEnabled(featureId FeatureId) bool {
 	// guard from using the alphaFeatureManager from multiple routines. Only the first one will create the cache.
-	withSync.Do(m.initConfigCache)
+	m.withSync.Do(m.initConfigCache)
 
-	//check if all features is ON
-	if allOn := isEnabled(m.userConfigCache, AllId); allOn {
-		return true
+	enabled := false
+	foundEnvVar := false
+	envValue := false
+
+	// There are two supported formats including dot notation and underscore notation.
+	envVarNames := []string{
+		fmt.Sprintf("AZD_ALPHA_ENABLE_%s", strings.ToUpper(string(featureId))),
+		fmt.Sprintf("AZD_ALPHA_ENABLE_%s", strings.ReplaceAll(strings.ToUpper(string(featureId)), ".", "_")),
 	}
 
-	// check if the feature is ON
-	if featureOn := isEnabled(m.userConfigCache, featureId); featureOn {
-		return true
+	// For testing, and in CI, allow enabling alpha features via the environment.
+	for _, envName := range envVarNames {
+		if value, has := os.LookupEnv(envName); has {
+			if boolVal, err := strconv.ParseBool(value); err == nil {
+				envValue = boolVal
+				foundEnvVar = true
+				break
+			} else {
+				log.Printf("could not parse %s as a bool when considering %s", value, envName)
+			}
+		}
 	}
 
-	return false
+	if foundEnvVar {
+		enabled = envValue
+	} else if allOn := isEnabled(m.userConfigCache, AllId); allOn {
+		//check if all features is ON
+		enabled = true
+		tracing.AppendUsageAttributeUnique(fields.AlphaFeaturesKey.String(string(AllId)))
+	} else if featureOn := isEnabled(m.userConfigCache, featureId); featureOn {
+		// check if the feature is ON
+		enabled = true
+	} else if val, ok := defaultEnablement[strings.ToLower(string(featureId))]; ok {
+		// check if the feature has been set with a default value internally
+		enabled = val
+	}
+
+	if enabled {
+		tracing.AppendUsageAttributeUnique(fields.AlphaFeaturesKey.String(string(featureId)))
+	}
+
+	return enabled
+}
+
+// defaultEnablement is a map of lower-cased feature ids to their default enablement values.
+//
+// This is used to determine if a feature is enabled by default, when no user configuration is specified.
+var defaultEnablement = map[string]bool{}
+
+// SetDefaultEnablement sets the default enablement value for the given feature id.
+func SetDefaultEnablement(id string, val bool) {
+	defaultEnablement[strings.ToLower(id)] = val
 }
 
 func isEnabled(config config.Config, id FeatureId) bool {

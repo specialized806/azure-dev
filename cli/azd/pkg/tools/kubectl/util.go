@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/braydonk/yaml"
 	"github.com/sethvargo/go-retry"
-	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -18,7 +18,7 @@ var (
 
 func GetResource[T any](
 	ctx context.Context,
-	cli KubectlCli,
+	cli *Cli,
 	resourceType ResourceType,
 	resourceName string,
 	flags *KubeCliFlags,
@@ -58,7 +58,7 @@ func GetResource[T any](
 
 func GetResources[T any](
 	ctx context.Context,
-	cli KubectlCli,
+	cli *Cli,
 	resourceType ResourceType,
 	flags *KubeCliFlags,
 ) (*List[T], error) {
@@ -99,8 +99,7 @@ type ResourceFilterFn[T comparable] func(resource T) bool
 
 func WaitForResource[T comparable](
 	ctx context.Context,
-	cli KubectlCli,
-	namespace string,
+	cli *Cli,
 	resourceType ResourceType,
 	resourceFilter ResourceFilterFn[T],
 	readyStatusFilter ResourceFilterFn[T],
@@ -111,9 +110,7 @@ func WaitForResource[T comparable](
 		ctx,
 		retry.WithMaxDuration(time.Minute*10, retry.NewConstant(time.Second*10)),
 		func(ctx context.Context) error {
-			result, err := GetResources[T](ctx, cli, resourceType, &KubeCliFlags{
-				Namespace: namespace,
-			})
+			result, err := GetResources[T](ctx, cli, resourceType, nil)
 
 			if err != nil {
 				return fmt.Errorf("failed waiting for resource, %w", err)

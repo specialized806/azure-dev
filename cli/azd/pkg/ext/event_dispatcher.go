@@ -40,17 +40,7 @@ func (ed *EventDispatcher[T]) AddHandler(name Event, handler EventHandlerFn[T]) 
 		return err
 	}
 
-	newHandler := fmt.Sprintf("%v", handler)
 	events := ed.handlers[name]
-
-	for _, ref := range events {
-		existingHandler := fmt.Sprintf("%v", ref)
-
-		if newHandler == existingHandler {
-			return fmt.Errorf("event handler has already been registered for %s event", name)
-		}
-	}
-
 	events = append(events, handler)
 	ed.handlers[name] = events
 
@@ -121,7 +111,7 @@ func (ed *EventDispatcher[T]) Invoke(ctx context.Context, name Event, eventArgs 
 	}
 
 	if err := action(); err != nil {
-		return fmt.Errorf("failing invoking action '%s', %w", name, err)
+		return err
 	}
 
 	if err := ed.RaiseEvent(ctx, postEventName, eventArgs); err != nil {

@@ -10,7 +10,8 @@ import: cspell.global.yaml
 ignorePaths:
     # Project changes here should be kept in-sync workflow cspell-misc.yml
     - cli # uses its own cspell config
-    - ext # uses its own cspell config
+    - ext/vscode # uses its own cspell config
+    - ext/devcontainer
     - templates # uses its own cspell config
 
     - eng # not required
@@ -28,12 +29,15 @@ overrides:
     - filename: generators/repo/tsconfig.json
       words:
           - tsbuildinfo
-    - filename: schemas/v1.0/azure.yaml.json
+    - filename: schemas/**/azure.yaml.json
       words:
           - prodapi
           - appservice
           - containerapp
+          - springapp
           - staticwebapp
           - myapp
           - azdev
           - myimage
+          - azureai
+          - entra

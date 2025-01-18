@@ -2,17 +2,22 @@
 
 /**               @ellismg @wbreza
 
-/cli/             @ellismg @wbreza @vhvb1989 @hemarina @weikanglim
+/cli/             @ellismg @wbreza @vhvb1989 @hemarina @weikanglim @JeffreyCA
 /cli/installer/   @ellismg @danieljurek
 
 /ext/             @karolz-ms @ellismg
 
-/generators/repo/ @wbreza @ellismg @danieljurek @jongio
+/generators/repo/ @wbreza @ellismg @danieljurek
 
 /.github/         @danieljurek @ellismg
 
+/.config/1espt/   @danieljurek @benbp @weshaggard
+
 /eng/             @danieljurek @ellismg
 
-/schemas/         @jongio @karolz-ms @ellismg @wbreza
+/schemas/         @karolz-ms @ellismg @wbreza
 
 /templates/       @jongio @wbreza
+
+# Exclude @jongio from version bump PRs opened by dependabot
+/templates/**/package-lock.json     @wbreza

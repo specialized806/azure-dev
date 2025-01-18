@@ -16,6 +16,8 @@ SUBSCRIPTION="2cd617ea-1866-46b1-90e3-fffb087ebf9b"
 ENV_SUFFIX="$RANDOM"
 # When set will only run tests without deployments
 TEST_ONLY=false
+# When set will validate template using playwright automation tests
+VALIDATE=true
 # When set will clean up local and remote resources
 CLEANUP=true
 # Used for internal pipeline testing. When set will skip azd init
@@ -36,6 +38,7 @@ function usage {
     echo "  -s    Sets the Azure subscription name or ID for the template tests to run in. (default: 2cd617ea-1866-46b1-90e3-fffb087ebf9b)"
     echo "  -u    Sets the environment suffix (default: RANDOM)"
     echo "  -n    When set will only run test commands. If true script won't deploy the templates. This is helpful when you already have the environments provisioned and you want to re-run the tests (default: false)"
+    echo "  -v    When set will validate template deployment with playwright automation tests (default: true)"
     echo "  -c    when set will clean up resources (default: true)"
     echo ""
     echo "Examples:"
@@ -48,7 +51,7 @@ function usage {
     exit 1
 }
 
-while getopts "f:t:b:e:r:p:l:s:u:n:c:h:d" arg; do
+while getopts "f:t:b:e:r:p:l:s:u:n:c:h:v:d" arg; do
     case ${arg} in
     f) FOLDER_PATH=$OPTARG ;;
     t) TEMPLATE_NAME=$OPTARG ;;
@@ -60,6 +63,7 @@ while getopts "f:t:b:e:r:p:l:s:u:n:c:h:d" arg; do
     s) SUBSCRIPTION=$OPTARG ;;
     u) ENV_SUFFIX=$OPTARG ;;
     n) TEST_ONLY=true ;;
+    v) VALIDATE=$OPTARG ;;
     c) CLEANUP=$OPTARG ;;
     d) DEVCONTAINER=true ;;
     h)
@@ -110,14 +114,31 @@ function deployTemplate {
 # $2 - The branch name
 # $3 - The environment name
 function testTemplate {
+    if [ $VALIDATE == false ]; then 
+        echo "Skipping playwright validation for $1..."
+        return
+    fi
+
+    if [[ "$1" == "azd-starter"* || "$1" == "Azure-Samples/azd-starter"* ]]; then
+        echo "Skipped smoke tests for azd-starter templates"
+        return
+    fi
+
     echo "Running template smoke tests for $3..."
     if [ $DEVCONTAINER == false ]; then
         cd "$FOLDER_PATH/$3/tests"
     else
         cd "tests"
     fi
+
     npm i && npx playwright install
     npx -y playwright test --retries="$PLAYWRIGHT_RETRIES" --reporter="$PLAYWRIGHT_REPORTER"
+
+    if [ $DEVCONTAINER == false ]; then
+        cd "$FOLDER_PATH/$3"
+    else
+        cd ".."
+    fi
 }
 
 # Cleans the specified template
@@ -126,11 +147,6 @@ function testTemplate {
 # $3 - The environment name
 function cleanupTemplate {
     echo "Deprovisioning infrastructure for $3..."
-    if [ $DEVCONTAINER == false ]; then
-        cd "$FOLDER_PATH/$3"
-    else
-        cd ..
-    fi
     azd down -e "$3" --force --purge
 
     echo "Cleaning up local project @ '$FOLDER_PATH/$3'..."
@@ -149,7 +165,7 @@ if [[ -z $TEMPLATE_NAME ]]; then
     while read -r TEMPLATE; do
         ENV_NAME="${ENV_NAME_PREFIX}-${TEMPLATE:14}-$ENV_SUFFIX"
         ENV_TEMPLATE_MAP[$TEMPLATE]=$ENV_NAME
-    done < <(echo "$TEMPLATES_JSON" | jq -r '.[].name' | sed 's/\\n/\n/g')
+    done < <(echo "$TEMPLATES_JSON" | jq -r '.[].repositoryPath' | sed 's/\\n/\n/g')
 
     if [ $TEST_ONLY == false ]; then
         # Deploy the templates in parallel

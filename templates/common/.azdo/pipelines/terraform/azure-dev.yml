@@ -1,21 +1,36 @@
+# Run when commits are pushed to mainline branch (main or master)
+# Set this to the mainline branch you are using
 trigger:
   - main
   - master
 
+# Azure Pipelines workflow to deploy to Azure using azd
+# To configure required secrets and service connection for connecting to Azure, simply run `azd pipeline config --provider azdo`
+# Task "Install azd" needs to install setup-azd extension for azdo - https://marketplace.visualstudio.com/items?itemName=ms-azuretools.azd
+# See below for alternative task to install azd if you can't install above task in your organization
+
 pool:
   vmImage: ubuntu-latest
 
-container: mcr.microsoft.com/azure-dev-cli-apps:latest
-
 steps:
+  - task: setup-azd@0
+    displayName: Install azd
+
+  # If you can't install above task in your organization, you can comment it and uncomment below task to install azd
+  # - task: Bash@3
+  #   displayName: Install azd
+  #   inputs:
+  #     targetType: 'inline'
+  #     script: |
+  #       curl -fsSL https://aka.ms/install-azd.sh | bash
+
+  # azd delegate auth to az to use service connection with AzureCLI@2
   - pwsh: |
       azd config set auth.useAzCliAuth "true"
     displayName: Configure AZD to Use AZ CLI Authentication.
-  - pwsh: |
-      azd config set alpha.terraform on
-    displayName: Enable terraform alpha feature from azd
+
   - task: AzureCLI@2
-    displayName: Azure Dev Provision
+    displayName: Provision Infrastructure
     inputs:
       azureSubscription: azconnection
       scriptType: bash
@@ -32,8 +47,10 @@ steps:
       RS_RESOURCE_GROUP: $(RS_RESOURCE_GROUP)
       RS_STORAGE_ACCOUNT: $(RS_STORAGE_ACCOUNT)
       RS_CONTAINER_NAME: $(RS_CONTAINER_NAME)
+      AZD_INITIAL_ENVIRONMENT_CONFIG: $(secrets.AZD_INITIAL_ENVIRONMENT_CONFIG)
+
   - task: AzureCLI@2
-    displayName: Azure Dev Deploy
+    displayName: Deploy Application
     inputs:
       azureSubscription: azconnection
       scriptType: bash

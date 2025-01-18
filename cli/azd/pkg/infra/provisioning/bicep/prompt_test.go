@@ -6,12 +6,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
 	"github.com/azure/azure-dev/cli/azd/pkg/azure"
-	"github.com/azure/azure-dev/cli/azd/pkg/convert"
-	"github.com/azure/azure-dev/cli/azd/pkg/exec"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockaccount"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,13 +44,7 @@ func TestPromptForParameter(t *testing.T) {
 			t.Parallel()
 
 			mockContext := mocks.NewMockContext(context.Background())
-
-			mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-				return strings.Contains(args.Cmd, "bicep") && args.Args[0] == "--version"
-			}).Respond(exec.RunResult{
-				Stdout: "Bicep CLI version 0.12.40 (41892bd0fb)",
-				Stderr: "",
-			})
+			prepareBicepMocks(mockContext)
 
 			p := createBicepProvider(t, mockContext)
 
@@ -89,7 +86,7 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "minValue",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:     "int",
-				MinValue: convert.RefOf(1),
+				MinValue: to.Ptr(1),
 			},
 			provided: []string{"0", "1"},
 			expected: 1,
@@ -99,7 +96,7 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "maxValue",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:     "int",
-				MaxValue: convert.RefOf(10),
+				MaxValue: to.Ptr(10),
 			},
 			provided: []string{"11", "10"},
 			expected: 10,
@@ -109,8 +106,8 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "rangeValue",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:     "int",
-				MinValue: convert.RefOf(1),
-				MaxValue: convert.RefOf(10),
+				MinValue: to.Ptr(1),
+				MaxValue: to.Ptr(10),
 			},
 			provided: []string{"0", "11", "5"},
 			expected: 5,
@@ -120,7 +117,7 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "minLength",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:      "string",
-				MinLength: convert.RefOf(1),
+				MinLength: to.Ptr(1),
 			},
 			provided: []string{"", "ok"},
 			expected: "ok",
@@ -130,7 +127,7 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "maxLength",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:      "string",
-				MaxLength: convert.RefOf(10),
+				MaxLength: to.Ptr(10),
 			},
 			provided: []string{"this is a very long string and will be rejected", "ok"},
 			expected: "ok",
@@ -140,8 +137,8 @@ func TestPromptForParameterValidation(t *testing.T) {
 			name: "rangeLength",
 			param: azure.ArmTemplateParameterDefinition{
 				Type:      "string",
-				MinLength: convert.RefOf(1),
-				MaxLength: convert.RefOf(10),
+				MinLength: to.Ptr(1),
+				MaxLength: to.Ptr(10),
 			},
 			provided: []string{"this is a very long string and will be rejected", "", "ok"},
 			expected: "ok",
@@ -179,13 +176,9 @@ func TestPromptForParameterValidation(t *testing.T) {
 
 		t.Run(tc.name, func(t *testing.T) {
 			mockContext := mocks.NewMockContext(context.Background())
+			prepareBicepMocks(mockContext)
 
-			mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-				return strings.Contains(args.Cmd, "bicep") && args.Args[0] == "--version"
-			}).Respond(exec.RunResult{
-				Stdout: "Bicep CLI version 0.12.40 (41892bd0fb)",
-				Stderr: "",
-			})
+			p := createBicepProvider(t, mockContext)
 
 			mockContext.Console.WhenPrompt(func(options input.ConsoleOptions) bool {
 				return strings.Contains(options.Message, "for the 'testParam' infrastructure parameter")
@@ -194,8 +187,6 @@ func TestPromptForParameterValidation(t *testing.T) {
 				tc.provided = tc.provided[1:]
 				return ret, nil
 			})
-
-			p := createBicepProvider(t, mockContext)
 
 			value, err := p.promptForParameter(*mockContext.Context, "testParam", tc.param)
 			require.NoError(t, err)
@@ -218,7 +209,7 @@ func TestPromptForParameterAllowedValues(t *testing.T) {
 
 	mockContext := mocks.NewMockContext(context.Background())
 
-	preparePlanningMocks(mockContext)
+	prepareBicepMocks(mockContext)
 
 	p := createBicepProvider(t, mockContext)
 
@@ -232,7 +223,7 @@ func TestPromptForParameterAllowedValues(t *testing.T) {
 
 	value, err := p.promptForParameter(*mockContext.Context, "testParam", azure.ArmTemplateParameterDefinition{
 		Type:          "string",
-		AllowedValues: convert.RefOf([]any{"three", "good", "choices"}),
+		AllowedValues: to.Ptr([]any{"three", "good", "choices"}),
 	})
 
 	require.NoError(t, err)
@@ -240,7 +231,7 @@ func TestPromptForParameterAllowedValues(t *testing.T) {
 
 	value, err = p.promptForParameter(*mockContext.Context, "testParam", azure.ArmTemplateParameterDefinition{
 		Type:          "int",
-		AllowedValues: convert.RefOf([]any{10, 20, 30}),
+		AllowedValues: to.Ptr([]any{10, 20, 30}),
 	})
 
 	require.NoError(t, err)
@@ -251,53 +242,43 @@ func TestPromptForParametersLocation(t *testing.T) {
 	t.Parallel()
 
 	mockContext := mocks.NewMockContext(context.Background())
+	prepareBicepMocks(mockContext)
 
-	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
-		return strings.Contains(args.Cmd, "bicep") && args.Args[0] == "--version"
-	}).Respond(exec.RunResult{
-		Stdout: "Bicep CLI version 0.12.40 (41892bd0fb)",
-		Stderr: "",
-	})
-
-	locations := []account.Location{
-		{
-			Name:                "eastus",
-			DisplayName:         "East US",
-			RegionalDisplayName: "(US) East US",
+	env := environment.New("test")
+	accountManager := &mockaccount.MockAccountManager{
+		Subscriptions: []account.Subscription{
+			{
+				Id:   "00000000-0000-0000-0000-000000000000",
+				Name: "test",
+			},
 		},
-		{
-			Name:                "eastus2",
-			DisplayName:         "East US 2",
-			RegionalDisplayName: "(US) East US 2",
-		},
-		{
-			Name:                "westus",
-			DisplayName:         "West US",
-			RegionalDisplayName: "(US) West US",
+		Locations: []account.Location{
+			{
+				Name:                "eastus",
+				DisplayName:         "East US",
+				RegionalDisplayName: "(US) East US",
+			},
+			{
+				Name:                "eastus2",
+				DisplayName:         "East US 2",
+				RegionalDisplayName: "(US) East US 2",
+			},
+			{
+				Name:                "westus",
+				DisplayName:         "West US",
+				RegionalDisplayName: "(US) West US",
+			},
 		},
 	}
 
 	p := createBicepProvider(t, mockContext)
-	p.prompters.Location = func(
-		ctx context.Context,
-		subscriptionId string,
-		msg string,
-		shouldDisplay func(loc account.Location) bool,
-	) (location string, err error) {
-		displayLocations := []string{}
-		for _, location := range locations {
-			if shouldDisplay(location) {
-				displayLocations = append(displayLocations, location.Name)
-			}
-		}
-
-		index, err := mockContext.Console.Select(ctx, input.ConsoleOptions{
-			Message: msg,
-			Options: displayLocations,
-		})
-		require.NoError(t, err)
-		return displayLocations[index], nil
-	}
+	p.prompters = prompt.NewDefaultPrompter(
+		env,
+		mockContext.Console,
+		accountManager,
+		p.resourceService,
+		cloud.AzurePublic(),
+	)
 
 	mockContext.Console.WhenSelect(func(options input.ConsoleOptions) bool {
 		return strings.Contains(options.Message, "'unfilteredLocation")

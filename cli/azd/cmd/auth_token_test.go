@@ -17,12 +17,14 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/azure/azure-dev/cli/azd/pkg/auth"
-	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/contracts"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/stretchr/testify/require"
 )
+
+const managementScope = "https://management.azure.com//.default"
 
 func TestAuthToken(t *testing.T) {
 	wasCalled := false
@@ -32,7 +34,7 @@ func TestAuthToken(t *testing.T) {
 		wasCalled = true
 
 		// Default value when explicit scopes are not provided to the command.
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 
 		return azcore.AccessToken{
 			Token:     "ABC123",
@@ -45,8 +47,11 @@ func TestAuthToken(t *testing.T) {
 		&output.JsonFormatter{},
 		buf,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) { return nil, fmt.Errorf("not an azd env directory") },
+		func(ctx context.Context) (*environment.Environment, error) {
+			return nil, fmt.Errorf("not an azd env directory")
+		},
 		&mockSubscriptionTenantResolver{},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -65,7 +70,7 @@ func TestAuthTokenSysEnv(t *testing.T) {
 	buf := &bytes.Buffer{}
 
 	token := authTokenFn(func(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 		return azcore.AccessToken{
 			Token:     "ABC123",
 			ExpiresOn: time.Unix(1669153000, 0).UTC(),
@@ -83,10 +88,13 @@ func TestAuthTokenSysEnv(t *testing.T) {
 		&output.JsonFormatter{},
 		buf,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) { return nil, fmt.Errorf("not an azd env directory") },
+		func(ctx context.Context) (*environment.Environment, error) {
+			return nil, fmt.Errorf("not an azd env directory")
+		},
 		&mockSubscriptionTenantResolver{
 			TenantId: expectedTenant,
 		},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -104,7 +112,7 @@ func TestAuthTokenSysEnvError(t *testing.T) {
 	buf := &bytes.Buffer{}
 
 	token := authTokenFn(func(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 		return azcore.AccessToken{
 			Token:     "ABC123",
 			ExpiresOn: time.Unix(1669153000, 0).UTC(),
@@ -128,10 +136,13 @@ func TestAuthTokenSysEnvError(t *testing.T) {
 				EnableDebugLogging: true,
 			},
 		},
-		func() (*environment.Environment, error) { return nil, fmt.Errorf("not an azd env directory") },
-		&mockSubscriptionTenantResolver{
-			Err: fmt.Errorf(expectedError),
+		func(ctx context.Context) (*environment.Environment, error) {
+			return nil, fmt.Errorf("not an azd env directory")
 		},
+		&mockSubscriptionTenantResolver{
+			Err: errors.New(expectedError),
+		},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -149,7 +160,7 @@ func TestAuthTokenAzdEnvError(t *testing.T) {
 	buf := &bytes.Buffer{}
 
 	token := authTokenFn(func(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 		return azcore.AccessToken{
 			Token:     "ABC123",
 			ExpiresOn: time.Unix(1669153000, 0).UTC(),
@@ -167,14 +178,15 @@ func TestAuthTokenAzdEnvError(t *testing.T) {
 		&output.JsonFormatter{},
 		buf,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) {
-			return environment.EphemeralWithValues(expectedEnvName, map[string]string{
+		func(ctx context.Context) (*environment.Environment, error) {
+			return environment.NewWithValues(expectedEnvName, map[string]string{
 				environment.SubscriptionIdEnvVarName: expectedSubId,
 			}), nil
 		},
 		&mockSubscriptionTenantResolver{
-			Err: fmt.Errorf(expectedError),
+			Err: errors.New(expectedError),
 		},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -192,7 +204,7 @@ func TestAuthTokenAzdEnv(t *testing.T) {
 	buf := &bytes.Buffer{}
 
 	token := authTokenFn(func(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 		return azcore.AccessToken{
 			Token:     "ABC123",
 			ExpiresOn: time.Unix(1669153000, 0).UTC(),
@@ -207,14 +219,15 @@ func TestAuthTokenAzdEnv(t *testing.T) {
 		&output.JsonFormatter{},
 		buf,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) {
-			return environment.EphemeralWithValues("env", map[string]string{
+		func(ctx context.Context) (*environment.Environment, error) {
+			return environment.NewWithValues("env", map[string]string{
 				environment.SubscriptionIdEnvVarName: "sub-id",
 			}), nil
 		},
 		&mockSubscriptionTenantResolver{
 			TenantId: expectedTenant,
 		},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -232,7 +245,7 @@ func TestAuthTokenAzdEnvWithEmpty(t *testing.T) {
 	buf := &bytes.Buffer{}
 
 	token := authTokenFn(func(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-		require.ElementsMatch(t, []string{azure.ManagementScope}, options.Scopes)
+		require.ElementsMatch(t, []string{managementScope}, options.Scopes)
 		return azcore.AccessToken{
 			Token:     "ABC123",
 			ExpiresOn: time.Unix(1669153000, 0).UTC(),
@@ -247,14 +260,15 @@ func TestAuthTokenAzdEnvWithEmpty(t *testing.T) {
 		&output.JsonFormatter{},
 		buf,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) {
-			return environment.EphemeralWithValues("env", map[string]string{
+		func(ctx context.Context) (*environment.Environment, error) {
+			return environment.NewWithValues("env", map[string]string{
 				environment.SubscriptionIdEnvVarName: "",
 			}), nil
 		},
 		&mockSubscriptionTenantResolver{
 			TenantId: expectedTenant,
 		},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -287,8 +301,11 @@ func TestAuthTokenCustomScopes(t *testing.T) {
 		&authTokenFlags{
 			scopes: scopes,
 		},
-		func() (*environment.Environment, error) { return nil, fmt.Errorf("not an azd env directory") },
+		func(ctx context.Context) (*environment.Environment, error) {
+			return nil, fmt.Errorf("not an azd env directory")
+		},
 		&mockSubscriptionTenantResolver{},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())
@@ -306,8 +323,11 @@ func TestAuthTokenFailure(t *testing.T) {
 		&output.JsonFormatter{},
 		io.Discard,
 		&authTokenFlags{},
-		func() (*environment.Environment, error) { return nil, fmt.Errorf("not an azd env directory") },
+		func(ctx context.Context) (*environment.Environment, error) {
+			return nil, fmt.Errorf("not an azd env directory")
+		},
 		&mockSubscriptionTenantResolver{},
+		cloud.AzurePublic(),
 	)
 
 	_, err := a.Run(context.Background())

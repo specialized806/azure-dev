@@ -138,10 +138,10 @@ repo:
     - from: ../../../../../common
       to: ./
       ignore:
-        - .github/**/*
-        - .devcontainer/**/*
+        - ".github/**/*"
+        - ".devcontainer/**/*"
         - "infra/**/*"
-        - .azdo/pipelines/*/azure-dev.yml
+        - ".azdo/**/*"
 
     # AzDo workflows for bicep
     - from: ../../../../../common/.azdo/pipelines/bicep/azure-dev.yml
@@ -158,10 +158,6 @@ repo:
     # .devcontainer common (devcontainer.json)
     - from: ../../../../../common/.devcontainer/devcontainer.json/python/devcontainer.json
       to: ./.devcontainer/devcontainer.json
-
-    # .devcontainer common (Dockerfile)
-    - from: ../../../../../common/.devcontainer/Dockerfile/base
-      to: ./.devcontainer
 
     # Assets common
     - from: ../../../../common/assets

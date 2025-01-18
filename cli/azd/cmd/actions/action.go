@@ -3,8 +3,6 @@ package actions
 
 import (
 	"context"
-
-	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
 )
 
 // ActionFunc is an Action implementation for regular functions.
@@ -29,28 +27,7 @@ type ActionResult struct {
 // Action is the representation of the application logic of a CLI command.
 type Action interface {
 	// Run executes the CLI command.
+	//
+	// It is currently valid to both return an error and a non-nil ActionResult.
 	Run(ctx context.Context) (*ActionResult, error)
-}
-
-// A function that lazily returns the specified action type T
-type ActionInitializer[T Action] func() (T, error)
-
-func ToUxItem(actionResult *ActionResult, err error) ux.UxItem {
-	if err != nil {
-		return &ux.ActionResult{
-			Err: err,
-		}
-	}
-
-	if actionResult == nil {
-		return &ux.ActionResult{}
-	}
-	if actionResult.Message == nil {
-		return &ux.ActionResult{}
-	}
-	return &ux.ActionResult{
-		SuccessMessage: actionResult.Message.Header,
-		FollowUp:       actionResult.Message.FollowUp,
-		Err:            nil,
-	}
 }

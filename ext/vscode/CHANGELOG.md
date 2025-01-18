@@ -1,6 +1,6 @@
 # Release History
 
-## 0.6.0-alpha.1 (Unreleased)
+## 0.9.0-alpha.1 (Unreleased)
 
 ### Features Added
 
@@ -9,6 +9,62 @@
 ### Bugs Fixed
 
 ### Other Changes
+
+## 0.8.4 (2024-10-28)
+
+### Other Changes
+ - [[#4420]](https://github.com/Azure/azure-dev/pull/4420) Add option to suppress readme
+ - [[#3894]](https://github.com/Azure/azure-dev/pull/3894) Add agent skill wrapping for down command
+
+## 0.8.3 (2024-05-07)
+
+### Other Changes
+ - [[#3845]](https://github.com/Azure/azure-dev/pull/3845) A small change to the Initialize App command to improve user experience.
+
+## 0.8.2 (2024-04-24)
+
+### Features Added
+
+- [[#3754]](https://github.com/Azure/azure-dev/pull/3754) A small change to the Install, Login, Initialize App, Up, and Pipeline Config commands to make them programmatically accessible.
+
+### Breaking Changes
+
+- [[#3621]](https://github.com/Azure/azure-dev/pull/3621) The Azure Developer CLI is now required to be at version 1.8.0 or higher. If an older version is installed, you will be prompted to update.
+
+## 0.8.1 (2024-03-06)
+
+### Features Added
+
+- [[#3353]](https://github.com/Azure/azure-dev/pull/3353) A small change to the Initialize App command to make it programmatically accessible.
+
+## 0.8.0 (2023-11-15)
+
+### Features Added
+
+- [[#2541]](https://github.com/Azure/azure-dev/pull/2541) Support has been added for the Azure Developer CLI to fetch authentication tokens from VSCode, reducing the need to re-authenticate. Use the setting `azure-dev.auth.useIntegratedAuth` to try this feature.
+- [[#2771]](https://github.com/Azure/azure-dev/pull/2771) Commands to enable or disable Dev Center mode have been added. Dev Center mode allows `azd` to leverage Infrastructure as Code (IaC) templates from Dev Center's centrally managed catalogs, manage remote Azure Deployment Environments (ADE) and seamlessly deploy applications to ADE environments using existing `azd deploy` commands.
+
+## 0.7.0 (2023-07-12)
+
+### Features Added
+
+- [[#2396]](https://github.com/Azure/azure-dev/pull/2396) Diagnostics have been added for `azure.yaml` files for when a path referenced as a project does not exist.
+- [[#2447]](https://github.com/Azure/azure-dev/pull/2447) An experience has been added to easily rename project paths referenced in `azure.yaml`.
+- [[#2448]](https://github.com/Azure/azure-dev/pull/2448) Services can be added to `azure.yaml` by dragging a folder and then holding `Shift` and dropping it into `azure.yaml`.
+
+### Bugs Fixed
+
+- [[#2504]](https://github.com/Azure/azure-dev/pull/2504) Fixed an issue where the "Azure Developer CLI (azd): Initialize App (init)" command would fail on Windows when executed immediately after installing AZD.
+
+## 0.6.0 (2023-05-17)
+
+### Features Added
+
+- [[#2122]](https://github.com/Azure/azure-dev/pull/2122) The appropriate schema for `azure.yaml` has been associated for use by the optional [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml). The YAML extension can offer syntax and schema validation, completions, hover tooltips, and more.
+
+### Other Changes
+
+- [[#2190]](https://github.com/Azure/azure-dev/pull/2190) Command names have been altered to appear more consistent with VS Code conventions. Commands have been grouped into submenus.
 
 ## 0.5.0 (2023-04-05)
 

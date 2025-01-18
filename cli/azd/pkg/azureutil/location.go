@@ -7,25 +7,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"golang.org/x/exp/slices"
 )
 
 // PromptLocation asks the user to select a location from a list of supported azure locations for a given subscription.
-func PromptLocation(
-	ctx context.Context, subscriptionId string, message string, help string, console input.Console,
-	accountManager account.Manager,
-) (string, error) {
-	return PromptLocationWithFilter(ctx, subscriptionId, message, help, console, accountManager,
-		func(_ account.Location) bool {
-			return true
-		})
-}
-
+// shouldDisplay, when non-nil, filters the location being displayed.
 func PromptLocationWithFilter(
 	ctx context.Context,
 	subscriptionId string,
@@ -43,14 +34,17 @@ func PromptLocationWithFilter(
 	locations := make([]account.Location, 0, len(allLocations))
 
 	for _, location := range allLocations {
-		if shouldDisplay(location) {
+		if strings.Contains(location.RegionalDisplayName, "STG") {
+			continue
+		}
+		if shouldDisplay == nil || shouldDisplay(location) {
 			locations = append(locations, location)
 		}
 	}
 
-	slices.SortFunc(locations, func(a, b account.Location) bool {
+	slices.SortFunc(locations, func(a, b account.Location) int {
 		return strings.Compare(
-			strings.ToLower(a.RegionalDisplayName), strings.ToLower(b.RegionalDisplayName)) < 0
+			strings.ToLower(a.RegionalDisplayName), strings.ToLower(b.RegionalDisplayName))
 	})
 
 	// Allow the environment variable `AZURE_LOCATION` to control the default value for the location
@@ -62,7 +56,7 @@ func PromptLocationWithFilter(
 		defaultLocation = accountManager.GetDefaultLocationName(ctx)
 	}
 
-	var defaultOption string
+	var defaultOption any
 
 	locationOptions := make([]string, len(locations))
 	for index, location := range locations {

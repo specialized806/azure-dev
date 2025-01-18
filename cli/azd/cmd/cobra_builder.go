@@ -1,9 +1,10 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"log"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/azure/azure-dev/cli/azd/cmd/actions"
@@ -18,14 +19,12 @@ import (
 // CobraBuilder manages the construction of the cobra command tree from nested ActionDescriptors
 type CobraBuilder struct {
 	container *ioc.NestedContainer
-	runner    *middleware.MiddlewareRunner
 }
 
 // Creates a new instance of the Cobra builder
 func NewCobraBuilder(container *ioc.NestedContainer) *CobraBuilder {
 	return &CobraBuilder{
 		container: container,
-		runner:    middleware.NewMiddlewareRunner(container),
 	}
 }
 
@@ -92,32 +91,26 @@ func (cb *CobraBuilder) configureActionResolver(cmd *cobra.Command, descriptor *
 	}
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-		ctx = tools.WithInstalledCheckCache(ctx)
-
-		// Registers the following to enable injection into actions that require them
-		ioc.RegisterInstance(cb.container, cb.runner)
-		ioc.RegisterInstance(cb.container, middleware.MiddlewareContext(cb.runner))
+		// Register root go context that will be used for resolving singleton dependencies
+		ctx := tools.WithInstalledCheckCache(cmd.Context())
 		ioc.RegisterInstance(cb.container, ctx)
-		ioc.RegisterInstance(cb.container, cmd)
-		ioc.RegisterInstance(cb.container, args)
 
-		if err := cb.registerMiddleware(descriptor); err != nil {
-			return err
+		// Create new container scope for the current command
+		cmdContainer, err := cb.container.NewScope()
+		if err != nil {
+			return fmt.Errorf("failed creating new scope for command, %w", err)
 		}
 
-		actionName := createActionName(cmd)
-		var action actions.Action
-		if err := cb.container.ResolveNamed(actionName, &action); err != nil {
-			if errors.Is(err, ioc.ErrResolveInstance) {
-				return fmt.Errorf(
-					//nolint:lll
-					"failed resolving action '%s'. Ensure the ActionResolver is a valid go function that returns an `actions.Action` interface, %w",
-					actionName,
-					err,
-				)
-			}
+		// Registers the following to enable injection into actions that require them
+		ioc.RegisterInstance(cmdContainer, ctx)
+		ioc.RegisterInstance(cmdContainer, cmd)
+		ioc.RegisterInstance(cmdContainer, args)
+		ioc.RegisterInstance(cmdContainer, cmdContainer)
+		ioc.RegisterInstance[ioc.ServiceLocator](cmdContainer, cmdContainer)
 
+		// Register any required middleware registered for the current action descriptor
+		middlewareRunner := middleware.NewMiddlewareRunner(cmdContainer)
+		if err := cb.registerMiddleware(middlewareRunner, descriptor); err != nil {
 			return err
 		}
 
@@ -129,28 +122,81 @@ func (cb *CobraBuilder) configureActionResolver(cmd *cobra.Command, descriptor *
 			Args:        args,
 		}
 
+		// Set the container that should be used for resolving middleware components
+		runOptions.WithContainer(cmdContainer)
+
 		// Run the middleware chain with action
-		log.Printf("Resolved action '%s'\n", actionName)
-		actionResult, err := cb.runner.RunAction(ctx, runOptions, action)
+		actionName := createActionName(cmd)
+		_, err = middlewareRunner.RunAction(ctx, runOptions, actionName)
 
 		// At this point, we know that there might be an error, so we can silence cobra from showing it after us.
 		cmd.SilenceErrors = true
 
-		// TODO: Consider refactoring to move the UX writing to a middleware
-		invokeErr := cb.container.Invoke(func(console input.Console) {
-			// It is valid for a command to return a nil action result and error.
-			// If we have a result or an error, display it, otherwise don't print anything.
-			if actionResult != nil || err != nil {
-				console.MessageUxItem(ctx, actions.ToUxItem(actionResult, err))
-			}
-		})
-
-		if invokeErr != nil {
-			return invokeErr
-		}
-
 		return err
 	}
+
+	return nil
+}
+
+// docsFlag is a flag with a custom parsing implementation which changes the default behavior for printing help
+// for all commands, when it is set as true.
+// docsFlag keeps a reference to the cobra command where it belongs so it can update it.
+// docsFlag also contains a callbacks to pull dependencies for the docs routine.
+type docsFlag struct {
+	// reference to the command where the flag was added.
+	command       *cobra.Command
+	consoleFn     func() input.Console
+	value         bool
+	defaultHelpFn func(*cobra.Command, []string)
+}
+
+// returns the flag value
+func (df *docsFlag) String() string {
+	return fmt.Sprintf("%t", df.value)
+}
+
+// define flag type
+func (df *docsFlag) Type() string {
+	return "bool"
+}
+
+// Set not only initialize the flag value, but it also turns the help flag true and defines the HelpFunc for the command.
+// This wiring forces cobra to react as it the --help flag was provided and stop the command early to run the HelpFunc.
+func (df *docsFlag) Set(value string) error {
+	v, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("invalid value for boolean --docs parameter")
+	}
+	df.value = v
+	if !df.value {
+		return nil
+	}
+
+	// Setting help to true will make cobra to stop and call the HelpFunc
+	if err = df.command.Flag("help").Value.Set("true"); err != nil {
+		// dev-issue: help flag should be already been added when
+		log.Panic("tried to set help after docs parameter: %w", err)
+	}
+
+	// keeping the default help function allows to set --help with higher priority and use it
+	// in case of finding --docs and --help
+	df.defaultHelpFn = df.command.HelpFunc()
+
+	// set help func for doing docs
+	df.command.SetHelpFunc(func(c *cobra.Command, args []string) {
+		console := df.consoleFn()
+		ctx := c.Context()
+		ctx = tools.WithInstalledCheckCache(ctx)
+
+		if slices.Contains(args, "--help") {
+			df.defaultHelpFn(c, args)
+			return
+		}
+
+		commandPath := strings.ReplaceAll(c.CommandPath(), " ", "-")
+		commandDocsUrl := referenceDocumentationUrl + commandPath
+		openWithDefaultBrowser(ctx, console, commandDocsUrl)
+	})
 
 	return nil
 }
@@ -161,6 +207,20 @@ func (cb *CobraBuilder) bindCommand(cmd *cobra.Command, descriptor *actions.Acti
 
 	// Automatically adds a consistent help flag
 	cmd.Flags().BoolP("help", "h", false, fmt.Sprintf("Gets help for %s.", cmd.Name()))
+	// docs flags for all commands
+	docsFlag := &docsFlag{
+		command: cmd,
+		consoleFn: func() input.Console {
+			var console input.Console
+			if err := cb.container.Resolve(&console); err != nil {
+				log.Panic("creating docs flag: %w", err)
+			}
+			return console
+		},
+	}
+	flag := cmd.Flags().VarPF(
+		docsFlag, "docs", "", fmt.Sprintf("Opens the documentation for %s in your web browser.", cmd.CommandPath()))
+	flag.NoOptDefVal = "true"
 
 	// Consistently registers output formats for the descriptor
 	if len(descriptor.Options.OutputFormats) > 0 {
@@ -169,7 +229,6 @@ func (cb *CobraBuilder) bindCommand(cmd *cobra.Command, descriptor *actions.Acti
 
 	// Create, register and bind flags when required
 	if descriptor.Options.FlagsResolver != nil {
-		log.Printf("registering flags for action '%s'\n", actionName)
 		ioc.RegisterInstance(cb.container, cmd)
 
 		// The flags resolver is constructed and bound to the cobra command via dependency injection
@@ -189,11 +248,10 @@ func (cb *CobraBuilder) bindCommand(cmd *cobra.Command, descriptor *actions.Acti
 	// These functions are typically the constructor function for the action. ex) newDeployAction(...)
 	// Action resolvers can take any number of dependencies and instantiated via the IoC container
 	if descriptor.Options.ActionResolver != nil {
-		log.Printf("registering resolver for action '%s'\n", actionName)
-		if err := cb.container.RegisterNamedSingleton(actionName, descriptor.Options.ActionResolver); err != nil {
+		if err := cb.container.RegisterNamedTransient(actionName, descriptor.Options.ActionResolver); err != nil {
 			return fmt.Errorf(
 				//nolint:lll
-				"failed registering ActionResolver for action'%s'. Ensure the resolver is a valid go function and resolves without error. %w",
+				"failed registering ActionResolver for action '%s'. Ensure the resolver is a valid go function and resolves without error. %w",
 				actionName,
 				err,
 			)
@@ -240,7 +298,10 @@ func (cb *CobraBuilder) bindCommand(cmd *cobra.Command, descriptor *actions.Acti
 // Registers all middleware components for the current command and any parent descriptors
 // Middleware components are insure to run in the order that they were registered from the
 // root registration, down through action groups and ultimately individual actions
-func (cb *CobraBuilder) registerMiddleware(descriptor *actions.ActionDescriptor) error {
+func (cb *CobraBuilder) registerMiddleware(
+	middlewareRunner *middleware.MiddlewareRunner,
+	descriptor *actions.ActionDescriptor,
+) error {
 	chain := []*actions.MiddlewareRegistration{}
 	current := descriptor
 
@@ -271,7 +332,7 @@ func (cb *CobraBuilder) registerMiddleware(descriptor *actions.ActionDescriptor)
 	// higher up the command structure are resolved before lower registrations
 	for i := len(chain) - 1; i > -1; i-- {
 		registration := chain[i]
-		if err := cb.runner.Use(registration.Name, registration.Resolver); err != nil {
+		if err := middlewareRunner.Use(registration.Name, registration.Resolver); err != nil {
 			return err
 		}
 	}

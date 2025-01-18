@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
 	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockinput"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,11 +38,11 @@ func TestNewBicepCli(t *testing.T) {
 		return strings.Contains(args.Cmd, "bicep") && len(args.Args) == 1 && args.Args[0] == "--version"
 	}).Respond(exec.NewRunResult(
 		0,
-		fmt.Sprintf("Bicep CLI version %s (abcdef0123)", cBicepVersion.String()),
+		fmt.Sprintf("Bicep CLI version %s (abcdef0123)", Version.String()),
 		"",
 	))
 
-	cli, err := newBicepCliWithTransporter(
+	cli, err := newCliWithTransporter(
 		*mockContext.Context, mockContext.Console, mockContext.CommandRunner, mockContext.HttpClient,
 	)
 	require.NoError(t, err)
@@ -106,13 +108,13 @@ func TestNewBicepCliWillUpgrade(t *testing.T) {
 		case OLD_FILE_CONTENTS:
 			return exec.NewRunResult(0, "Bicep CLI version 0.0.1 (badbadbad1)", ""), nil
 		case NEW_FILE_CONTENTS:
-			return exec.NewRunResult(0, fmt.Sprintf("Bicep CLI version %s (abcdef0123)", cBicepVersion.String()), ""), nil
+			return exec.NewRunResult(0, fmt.Sprintf("Bicep CLI version %s (abcdef0123)", Version.String()), ""), nil
 		}
 
 		return exec.NewRunResult(-1, "", "unexpected bicep file contents"), err
 	})
 
-	cli, err := newBicepCliWithTransporter(
+	cli, err := newCliWithTransporter(
 		*mockContext.Context, mockContext.Console, mockContext.CommandRunner, mockContext.HttpClient,
 	)
 	require.NoError(t, err)
@@ -136,4 +138,76 @@ func TestNewBicepCliWillUpgrade(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []byte(NEW_FILE_CONTENTS), contents)
+}
+
+func Test_preferMuslBicep(t *testing.T) {
+	tests := []struct {
+		name     string
+		hasMusl  bool
+		hasGlibc bool
+		want     bool
+	}{
+		{
+			name:     "musl preferred",
+			hasMusl:  true,
+			hasGlibc: false,
+			want:     true,
+		},
+		{
+			name:     "glibc preferred",
+			hasMusl:  false,
+			hasGlibc: true,
+			want:     false,
+		},
+		{
+			name:     "both available",
+			hasMusl:  true,
+			hasGlibc: true,
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockStat := func(name string) (os.FileInfo, error) {
+				if tt.hasMusl && name == "/lib/ld-musl-x86_64.so.1" {
+					return &fakeFileInfo{}, nil
+				}
+				if tt.hasGlibc && name == "/lib/x86_64-linux-gnu/libc.so.6" {
+					return &fakeFileInfo{}, nil
+				}
+
+				return nil, os.ErrNotExist
+			}
+			got := preferMuslBicep(mockStat)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+type fakeFileInfo struct {
+}
+
+func (f *fakeFileInfo) Name() string {
+	return ""
+}
+
+func (f *fakeFileInfo) Size() int64 {
+	return 0
+}
+
+func (f *fakeFileInfo) Mode() os.FileMode {
+	return 0
+}
+
+func (f *fakeFileInfo) ModTime() time.Time {
+	return time.Time{}
+}
+
+func (f *fakeFileInfo) IsDir() bool {
+	return false
+}
+
+func (f *fakeFileInfo) Sys() interface{} {
+	return nil
 }

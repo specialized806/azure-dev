@@ -12,18 +12,20 @@ steps:
       parameters:
           Version: $(AzdVersion)
 
-    - template: /eng/pipelines/templates/steps/azd-login.yml
-
-    # Java pre-requisites that isn't met
-    # TODO: Use azd container as a form of validation that the container works
-    - template: /eng/pipelines/templates/steps/install-ms-openjdk.yml
-
     # Required to clone repos that are not yet public
     - template: /eng/pipelines/templates/steps/set-git-credentials.yml
 
+    - template: /eng/pipelines/templates/steps/configure-oidc-auth.yml
+
     - pwsh: |
-          # Remove 'Azure-Samples/'
-          $templateName = '$(TemplateName)'.Substring(14)
+          # Get the name without any path
+          $template = '$(TemplateName)'
+          $lastSlash = $template.LastIndexOf('/')
+          if ($lastSlash -ne -1) {
+            $templateName = $template.Substring($lastSlash + 1)
+          } else {
+            $templateName = $template
+          }
           $scenario = "$env:TEST_SCENARIO"
           $envPrefixName = "azd-template-test"
           if($scenario -ne '') {
@@ -60,30 +62,30 @@ steps:
           TargetFolder: "$(Build.SourcesDirectory)/temp"
       displayName: Copy test-templates.sh
 
+    - bash: |
+        go build -o ./temp/tfoidc ./cli/azd/test/internal/tfoidc 
+      displayName: Build tfoidc
+
     - task: DevcontainersCI@0
       inputs:
           env: |
-              # Required secrets for Terraform service principal authentication
-              ARM_CLIENT_ID=$(arm-client-id)
-              ARM_CLIENT_SECRET=$(arm-client-secret)
-              ARM_TENANT_ID=$(arm-tenant-id)
-              SUBSCRIPTION_ID=$(SubscriptionId)
+              # Service Connection Configuration
+              AZURESUBSCRIPTION_CLIENT_ID=$(AzureSubscriptionClientId)
+              AZURESUBSCRIPTION_TENANT_ID=$(AzureSubscriptionTenantId)
+              AZURESUBSCRIPTION_SERVICE_CONNECTION_ID=$(AzureSubscriptionServiceConnectionId)
+              AZURESUBSCRIPTION_SUBSCRIPTION_ID=$(SubscriptionId)
+              SYSTEM_ACCESSTOKEN=$(System.AccessToken)
+              SYSTEM_OIDCREQUESTURI=$(System.OidcRequestUri)
+
+              # Terraform Configuration
+              ARM_CLIENT_ID=$(AzureSubscriptionClientId)
+              ARM_TENANT_ID=$(AzureSubscriptionTenantId)
 
               # Pass in TemplateRunEnvironmentVariables
               $(VARIABLE_LIST)
 
-              # Bash Script parameters
-              BRANCH_NAME=$(TemplateBranchName)
-              ENV_NAME_PREFIX=$(EnvPrefixName)
-              TEMPLATE_NAME=$(TemplateName)
-              PLAYWRIGHT_REPORTER='list'
-              LOCATION=$(AzureLocation)
-              SUBSCRIPTION=$(SubscriptionId)
-              ENV_SUFFIX=$(Build.BuildId)-$(System.JobAttempt)
-              CLEANUP=$(SynchronousCleanup)
-
-              AZD_VERSION=$(AzdVersion)
-              AZD_DEBUG_FORCE_NO_TTY="1"
+              # Force no TTY in CI
+              AZD_DEBUG_FORCE_NO_TTY=1
           subFolder: "$(Build.SourcesDirectory)/temp"
           runCmd: |
               # Uninstall azd version
@@ -92,27 +94,33 @@ steps:
               # Install azd build
               if [[ $(AzdVersion) == pr/* ]];
               then
-                curl -fsSL https://aka.ms/install-azd.sh | sudo bash -s -- --base-url "https://$(azdev-storage-account-name).blob.core.windows.net/azd/standalone/$(AzdVersion)" --skip-verify --version ''
+                curl -fsSL https://aka.ms/install-azd.sh | sudo bash -s -- --base-url "$(publish-storage-location)/azd/standalone/$(AzdVersion)" --skip-verify --version ''
               else
                 curl -fsSL https://aka.ms/install-azd.sh | sudo bash -s -- --version $(AzdVersion) --verbose
               fi
 
+              RUN_VALIDATION=true
+              if [[ "$(TemplateName)" == *aks* ]]; then
+                RUN_VALIDATION=false
+              fi
+
               azd version
 
-              # Login
-              azd auth login \
-                --client-id "$(arm-client-id)" \
-                --client-secret "$(arm-client-secret)" \
-                --tenant-id "$(arm-tenant-id)"
+              # Login azd
+              azd auth login --federated-credential-provider azure-pipelines
 
-              # enable alpha features
-              azd config set alpha.all on
-
-              # Install these packages for playwright tests. Otherwise, it will cause a error of playwright missing libraries 
+              # Install these packages for playwright tests. Otherwise, it will cause a error of playwright missing libraries
               sudo add-apt-repository ppa:gstreamer-developers/ppa
               sudo apt-get update
-              sudo apt-get install gstreamer1.0*
+              sudo apt-get install -y gstreamer1.0*
               sudo apt-get install -y gstreamer1.0-libav libnss3-tools libatk-bridge2.0-0 libcups2-dev libxkbcommon-x11-0 libxcomposite-dev libxrandr2 libgbm-dev libgtk-3-0
+
+              # Run tfoidc in background and configure Terraform to use OIDC via it.
+              ./tfoidc -refresh-az &
+
+              export ARM_USE_OIDC=true
+              export ARM_OIDC_REQUEST_URL=http://localhost:27838/oidctoken
+              export ARM_OIDC_REQUEST_TOKEN=$(System.AccessToken)
 
               # Run template test bash script
               chmod u+x test-templates.sh
@@ -125,44 +133,47 @@ steps:
                 -l '$(AzureLocation)' \
                 -p 'list' \
                 -c '$(SynchronousCleanup)' \
+                -v "$RUN_VALIDATION" \
 
-      displayName: Test templates in Devcontainer
-
-    - template: /eng/pipelines/templates/steps/az-login.yml
-      parameters:
-          Condition: always()
+      displayName: Run template-test.sh in Devcontainer
 
     # First tag the resource group (if exists) so that it can get cleaned up
     # by the cleanup pipeline. Then attempt to delete the resource group
     # directly. If the delete fails the cleanup pipeline will delete it.
-    - pwsh: |
-          $errOutput = ($( $output = & az group show --resource-group '$(ResourceGroupName)' --query id ) 2>&1) -join [System.Environment]::NewLine
-          if ($LASTEXITCODE) {
-            if ($errOutput -match "ResourceGroupNotFound") {
-              Write-Host "Resource group $(ResourceGroupName) has already been deleted."
-              exit 0
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: azd-service-connection
+        keepAzSessionActive: true
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+            $errOutput = ($( $output = & az group show --resource-group '$(ResourceGroupName)' --query id ) 2>&1) -join [System.Environment]::NewLine
+            if ($LASTEXITCODE) {
+              if ($errOutput -match "ResourceGroupNotFound") {
+                Write-Host "Resource group $(ResourceGroupName) has already been deleted."
+                exit 0
+              }
+
+              Write-Error "Error querying for resource group. Exit code: $LASTEXITCODE, $errOutput"
+              exit 1
             }
 
-            Write-Error "Error querying for resource group. Exit code: $LASTEXITCODE, $errOutput"
-            exit 1
-          }
+            $resourceGroupId = $output
 
-          $resourceGroupId = $output
+            if ('$(CleanupImmediate)' -eq 'true') {
+              # Tag the resource group so it gets cleaned up later if delete fails
+              az tag create `
+                --resource-id $resourceGroupId `
+                --tags DeleteAfter="$((Get-Date -AsUTC).ToString('o'))"
 
-          if ('$(CleanupImmediate)' -eq 'true') {
-            # Tag the resource group so it gets cleaned up later if delete fails
-            az tag create `
-              --resource-id $resourceGroupId `
-              --tags DeleteAfter="$((Get-Date -AsUTC).ToString('o'))"
-
-            # Attempt to delete the resource group
-            az group delete --resource-group $(ResourceGroupName) --yes --no-wait
-          } else {
-            $delayInHours = [int]'$(CleanupHoursDelay)'
-            # Tag the resource group for delayed cleanup
-            az tag create `
-              --resource-id $resourceGroupId `
-              --tags DeleteAfter="$((Get-Date -AsUTC).AddHours($delayInHours).ToString('o'))"
-          }
+              # Attempt to delete the resource group
+              az group delete --resource-group $(ResourceGroupName) --yes --no-wait
+            } else {
+              $delayInHours = [int]'$(CleanupHoursDelay)'
+              # Tag the resource group for delayed cleanup
+              az tag create `
+                --resource-id $resourceGroupId `
+                --tags DeleteAfter="$((Get-Date -AsUTC).AddHours($delayInHours).ToString('o'))"
+            }
       condition: always()
       displayName: Tag resource group for deletion

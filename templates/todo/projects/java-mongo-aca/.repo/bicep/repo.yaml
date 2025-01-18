@@ -99,13 +99,7 @@ repo:
 
     - from: ../../../../common/infra/bicep/app/api-container-app.bicep
       to: ./infra/app/api.bicep
-
-    - from: ../../../../common/infra/bicep/app/web-container-app.parameters.json
-      to: ./infra/app/web.parameters.json
-
-    - from: ../../../../common/infra/bicep/app/api-container-app.parameters.json
-      to: ./infra/app/api.parameters.json
-    
+   
     - from: ../../../../common/infra/bicep/app/apim-api.bicep
       to: ./infra/app/apim-api.bicep
 
@@ -138,17 +132,17 @@ repo:
     - from: ../../../../../common
       to: ./
       ignore:
-        - .github/**/*
-        - .devcontainer/**/*
+        - ".github/**/*"
+        - ".devcontainer/**/*"
         - "infra/**/*"
-        - .azdo/pipelines/*/azure-dev.yml
+        - ".azdo/**/*"
 
     # AzDo workflows for bicep
-    - from: ../../../../../common/.azdo/pipelines/bicep/azure-dev.yml
+    - from: ../../../../../common/.azdo/pipelines/java/azure-dev.yml
       to: ./.azdo/pipelines/azure-dev.yml
 
     # Github workflows for bicep
-    - from: ../../../../../common/.github/workflows/bicep
+    - from: ../../../../../common/.github/workflows/java
       to: ./.github/workflows
 
     # azd core modules
@@ -156,12 +150,8 @@ repo:
       to: ./infra
 
     # .devcontainer common (devcontainer.json)
-    - from: ../../../../../common/.devcontainer/devcontainer.json/java
-      to: ./.devcontainer
-
-    # .devcontainer common (Dockerfile)
-    - from: ../../../../../common/.devcontainer/Dockerfile/base
-      to: ./.devcontainer
+    - from: ../../../../../common/.devcontainer/devcontainer.json/java/devcontainer.json
+      to: ./.devcontainer/devcontainer.json
 
     # Assets common
     - from: ../../../../common/assets

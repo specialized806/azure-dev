@@ -15,9 +15,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/test/azdcli"
+	"github.com/azure/azure-dev/cli/azd/test/recording"
 	"github.com/joho/godotenv"
 	"github.com/sethvargo/go-retry"
 	"github.com/stretchr/testify/assert"
@@ -49,7 +55,7 @@ func Test_CLI_Up_Down_WebApp(t *testing.T) {
 	_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
 	require.NoError(t, err)
 
-	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "infra", "create")
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
 	require.NoError(t, err)
 
 	t.Logf("Running show\n")
@@ -85,10 +91,10 @@ func Test_CLI_Up_Down_WebApp(t *testing.T) {
 	url, has := env["WEBSITE_URL"]
 	require.True(t, has, "WEBSITE_URL should be in environment after infra create")
 
-	err = probeServiceHealth(t, ctx, url, expectedTestAppResponse)
+	err = probeServiceHealth(t, ctx, http.DefaultClient, retry.NewConstant(5*time.Second), url, expectedTestAppResponse)
 	require.NoError(t, err)
 
-	commandRunner := exec.NewCommandRunner(os.Stdin, os.Stdout, os.Stderr)
+	commandRunner := exec.NewCommandRunner(nil)
 	runArgs := newRunArgs("dotnet", "user-secrets", "list", "--project", filepath.Join(dir, "/src/dotnet/webapp.csproj"))
 	secrets, err := commandRunner.Run(ctx, runArgs)
 	require.NoError(t, err)
@@ -107,7 +113,7 @@ func Test_CLI_Up_Down_WebApp(t *testing.T) {
 	secrets, err = commandRunner.Run(ctx, runArgs)
 	require.NoError(t, err)
 
-	_, err = cli.RunCommand(ctx, "env", "refresh")
+	_, err = cli.RunCommand(ctx, "env", "refresh", envName)
 	require.NoError(t, err)
 
 	env, err = godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
@@ -123,7 +129,7 @@ func Test_CLI_Up_Down_WebApp(t *testing.T) {
 	contain = strings.Contains(secrets.Stdout, fmt.Sprintf("WEBSITE_URL = %s", url))
 	require.True(t, contain)
 
-	_, err = cli.RunCommand(ctx, "infra", "delete", "--force", "--purge")
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
 	require.NoError(t, err)
 
 	t.Logf("Running show (again)\n")
@@ -166,7 +172,7 @@ func Test_CLI_Up_Down_FuncApp(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Logf("Starting infra create\n")
-	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "infra", "create", "--cwd", dir)
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision", "--cwd", dir)
 	require.NoError(t, err)
 
 	t.Logf("Starting deploy\n")
@@ -206,82 +212,317 @@ func Test_CLI_Up_Down_FuncApp(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Logf("Starting infra delete\n")
-	_, err = cli.RunCommand(ctx, "infra", "delete", "--cwd", dir, "--force", "--purge")
+	_, err = cli.RunCommand(ctx, "down", "--cwd", dir, "--force", "--purge")
 	require.NoError(t, err)
 
 	t.Logf("Done\n")
 }
 
 func Test_CLI_Up_Down_ContainerApp(t *testing.T) {
+	t.Parallel()
+
 	if ci_os := os.Getenv("AZURE_DEV_CI_OS"); ci_os != "" && ci_os != "lin" {
 		t.Skip("Skipping due to docker limitations for non-linux systems on CI")
 	}
 
-	tests := []struct {
-		name                  string
-		provisionContainerApp bool
-	}{
-		{"CreateContainerAppAtProvision", true},
-		{"CreateContainerAppAtDeploy", false},
+	ctx, cancel := newTestContext(t)
+	defer cancel()
+
+	dir := tempDirWithDiagnostics(t)
+	t.Logf("DIR: %s", dir)
+
+	session := recording.Start(t)
+
+	envName := randomOrStoredEnvName(session)
+	t.Logf("AZURE_ENV_NAME: %s", envName)
+
+	cli := azdcli.NewCLI(t, azdcli.WithSession(session))
+	cli.WorkingDirectory = dir
+	cli.Env = append(cli.Env, os.Environ()...)
+	cli.Env = append(cli.Env, "AZURE_LOCATION=eastus2")
+
+	defer cleanupDeployments(ctx, t, cli, session, envName)
+
+	err := copySample(dir, "containerapp")
+	require.NoError(t, err, "failed expanding sample")
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommand(ctx, "deploy", "--cwd", filepath.Join(dir, "src", "dotnet"))
+	require.NoError(t, err)
+
+	// The sample hosts a small application that just responds with a 200 OK with a body of "Hello, `azd`."
+	// (without the quotes). Validate that the application is working.
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	url, has := env["WEBSITE_URL"]
+	require.True(t, has, "WEBSITE_URL should be in environment after deploy")
+
+	if session == nil {
+		err = probeServiceHealth(
+			t, ctx, http.DefaultClient, retry.NewConstant(5*time.Second), url, expectedTestAppResponse)
+		require.NoError(t, err)
+	} else {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+
+		err = probeServiceHealth(
+			t, ctx, session.ProxyClient, retry.NewConstant(1*time.Millisecond), url, expectedTestAppResponse)
+		require.NoError(t, err)
 	}
 
-	for _, tt := range tests {
-		tc := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
+	require.NoError(t, err)
 
-			ctx, cancel := newTestContext(t)
-			defer cancel()
+	// As part of deleting the infrastructure, outputs of the infrastructure such as "WEBSITE_URL" should
+	// have been removed from the environment.
+	env, err = godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
 
-			dir := tempDirWithDiagnostics(t)
-			t.Logf("DIR: %s", dir)
+	_, has = env["WEBSITE_URL"]
+	require.False(t, has, "WEBSITE_URL should have been removed from the environment as part of infrastructure removal")
+}
 
-			envName := randomEnvName()
-			t.Logf("AZURE_ENV_NAME: %s", envName)
+func Test_CLI_Up_Down_ContainerAppDotNetPublish(t *testing.T) {
+	t.Parallel()
 
-			cli := azdcli.NewCLI(t)
-			cli.WorkingDirectory = dir
-			cli.Env = append(os.Environ(),
-				"AZURE_LOCATION=eastus2",
-				fmt.Sprintf("AZURE_PROVISION_CONTAINER_APP=%t", tc.provisionContainerApp))
+	ctx, cancel := newTestContext(t)
+	defer cancel()
 
-			err := copySample(dir, "containerapp")
-			require.NoError(t, err, "failed expanding sample")
+	dir := tempDirWithDiagnostics(t)
+	t.Logf("DIR: %s", dir)
 
-			_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
-			require.NoError(t, err)
+	session := recording.Start(t)
 
-			_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "infra", "create")
-			require.NoError(t, err)
+	envName := randomOrStoredEnvName(session)
+	t.Logf("AZURE_ENV_NAME: %s", envName)
 
-			_, err = cli.RunCommand(ctx, "deploy", "--cwd", filepath.Join(dir, "src", "dotnet"))
-			require.NoError(t, err)
+	cli := azdcli.NewCLI(t, azdcli.WithSession(session))
+	cli.WorkingDirectory = dir
+	cli.Env = append(cli.Env, os.Environ()...)
+	cli.Env = append(cli.Env, "AZURE_LOCATION=eastus2")
 
-			// The sample hosts a small application that just responds with a 200 OK with a body of "Hello, `azd`."
-			// (without the quotes). Validate that the application is working.
-			env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
-			require.NoError(t, err)
+	defer cleanupDeployments(ctx, t, cli, session, envName)
 
-			url, has := env["WEBSITE_URL"]
-			require.True(t, has, "WEBSITE_URL should be in environment after deploy")
+	err := copySample(dir, "containerapp")
+	require.NoError(t, err, "failed expanding sample")
 
-			err = probeServiceHealth(t, ctx, url, expectedTestAppResponse)
-			require.NoError(t, err)
+	// Remove the Dockerfile so that we go down the `dotnet publish` path.
+	err = os.Remove(filepath.Join(dir, "src", "dotnet", "Dockerfile"))
+	require.NoError(t, err)
 
-			_, err = cli.RunCommand(ctx, "infra", "delete", "--force", "--purge")
-			require.NoError(t, err)
-		})
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommand(ctx, "deploy", "--cwd", filepath.Join(dir, "src", "dotnet"))
+	require.NoError(t, err)
+
+	// The sample hosts a small application that just responds with a 200 OK with a body of "Hello, `azd`."
+	// (without the quotes). Validate that the application is working.
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	url, has := env["WEBSITE_URL"]
+	require.True(t, has, "WEBSITE_URL should be in environment after deploy")
+
+	if session == nil {
+		err = probeServiceHealth(
+			t, ctx, http.DefaultClient, retry.NewConstant(5*time.Second), url, expectedTestAppResponse)
+		require.NoError(t, err)
+	} else {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+
+		err = probeServiceHealth(
+			t, ctx, session.ProxyClient, retry.NewConstant(1*time.Millisecond), url, expectedTestAppResponse)
+		require.NoError(t, err)
 	}
+
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
+	require.NoError(t, err)
+
+	// As part of deleting the infrastructure, outputs of the infrastructure such as "WEBSITE_URL" should
+	// have been removed from the environment.
+	env, err = godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	_, has = env["WEBSITE_URL"]
+	require.False(t, has, "WEBSITE_URL should have been removed from the environment as part of infrastructure removal")
+}
+
+func Test_CLI_Up_Down_ContainerApp_RemoteBuild(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := newTestContext(t)
+	defer cancel()
+
+	dir := tempDirWithDiagnostics(t)
+	t.Logf("DIR: %s", dir)
+
+	session := recording.Start(t)
+
+	envName := randomOrStoredEnvName(session)
+	t.Logf("AZURE_ENV_NAME: %s", envName)
+
+	cli := azdcli.NewCLI(t, azdcli.WithSession(session))
+	cli.WorkingDirectory = dir
+	cli.Env = append(cli.Env, os.Environ()...)
+	cli.Env = append(cli.Env, "AZURE_LOCATION=eastus2")
+
+	defer cleanupDeployments(ctx, t, cli, session, envName)
+
+	err := copySample(dir, "containerremotebuildapp")
+	require.NoError(t, err, "failed expanding sample")
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommand(ctx, "deploy", "--cwd", filepath.Join(dir, "src", "app"))
+	require.NoError(t, err)
+
+	// The sample hosts a small application that just responds with a 200 OK with a body of "Hello, `azd`."
+	// (without the quotes). Validate that the application is working.
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	url, has := env["WEBSITE_URL"]
+	require.True(t, has, "WEBSITE_URL should be in environment after deploy")
+
+	if session == nil {
+		err = probeServiceHealth(
+			t, ctx, http.DefaultClient, retry.NewConstant(5*time.Second), url, expectedTestAppResponse)
+		require.NoError(t, err)
+	} else {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+
+		err = probeServiceHealth(
+			t, ctx, session.ProxyClient, retry.NewConstant(1*time.Millisecond), url, expectedTestAppResponse)
+		require.NoError(t, err)
+	}
+
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
+	require.NoError(t, err)
+
+	// As part of deleting the infrastructure, outputs of the infrastructure such as "WEBSITE_URL" should
+	// have been removed from the environment.
+	env, err = godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	_, has = env["WEBSITE_URL"]
+	require.False(t, has, "WEBSITE_URL should have been removed from the environment as part of infrastructure removal")
+}
+
+func Test_CLI_Up_ResourceGroupScope(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := newTestContext(t)
+	defer cancel()
+
+	dir := tempDirWithDiagnostics(t)
+	t.Logf("DIR: %s", dir)
+
+	session := recording.Start(t)
+	client := http.DefaultClient
+	subscriptionId := cfg.SubscriptionID
+	if session != nil {
+		client = session.ProxyClient
+
+		if session.Playback {
+			subscriptionId = session.Variables[recording.SubscriptionIdKey]
+		}
+	}
+
+	if subscriptionId == "" {
+		t.Skip("Skipping test because no subscription was provided")
+	}
+
+	envName := randomOrStoredEnvName(session)
+	t.Logf("AZURE_ENV_NAME: %s", envName)
+
+	resourceGroupName := fmt.Sprintf("rg-%s", envName)
+
+	cli := azdcli.NewCLI(t, azdcli.WithSession(session))
+	cli.WorkingDirectory = dir
+	cli.Env = append(cli.Env, os.Environ()...)
+	cli.Env = append(cli.Env,
+		"AZURE_LOCATION=eastus2")
+
+	cred := azdcli.NewTestCredential(cli)
+
+	rgClient, err := armresources.NewResourceGroupsClient(subscriptionId, cred, &arm.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: client,
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = rgClient.CreateOrUpdate(context.Background(), resourceGroupName, armresources.ResourceGroup{
+		Name:     to.Ptr(resourceGroupName),
+		Location: to.Ptr("eastus2"),
+		Tags: map[string]*string{
+			"DeleteAfter": to.Ptr(time.Now().Add(60 * time.Minute).UTC().Format(time.RFC3339)),
+		},
+	}, nil)
+
+	require.NoError(t, err)
+
+	err = copySample(dir, "storage-rg")
+	require.NoError(t, err, "failed expanding sample")
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForInit(envName), "init")
+	require.NoError(t, err)
+
+	_, err = cli.RunCommand(ctx, "env", "set", "AZURE_RESOURCE_GROUP", resourceGroupName)
+	require.NoError(t, err)
+
+	_, err = cli.RunCommandWithStdIn(ctx, stdinForProvision(), "provision")
+	require.NoError(t, err)
+
+	// The sample outputs the ID of the storage account it created, let's make sure that resource is in the resource
+	// group we created (by looking at the resourceGroup component in the id)
+	env, err := godotenv.Read(filepath.Join(dir, azdcontext.EnvironmentDirectoryName, envName, ".env"))
+	require.NoError(t, err)
+
+	storageAccountId, has := env["STORAGE_ACCOUNT_ID"]
+	require.True(t, has)
+
+	require.Contains(t, strings.ToLower(storageAccountId), fmt.Sprintf("/resourcegroups/%s/", resourceGroupName))
+
+	if session != nil {
+		session.Variables[recording.SubscriptionIdKey] = env[environment.SubscriptionIdEnvVarName]
+	}
+
+	_, err = cli.RunCommand(ctx, "down", "--force", "--purge")
+	require.NoError(t, err)
+}
+
+type httpClient interface {
+	Get(url string) (*http.Response, error)
 }
 
 // Validates that the service is up-and-running, by issuing a GET request
 // and expecting a 2XX status code, with a matching response body.
-func probeServiceHealth(t *testing.T, ctx context.Context, url string, expectedBody string) error {
-	return retry.Do(ctx, retry.WithMaxRetries(10, retry.NewConstant(5*time.Second)), func(ctx context.Context) error {
+func probeServiceHealth(
+	t *testing.T,
+	ctx context.Context,
+	client httpClient,
+	backOff retry.Backoff,
+	url string,
+	expectedBody string) error {
+	return retry.Do(ctx, retry.WithMaxRetries(10, backOff), func(ctx context.Context) error {
 		t.Logf("Attempting to Get URL: %s", url)
 
 		/* #nosec G107 - Potential HTTP request made with variable url false positive */
-		res, err := http.Get(url)
+		res, err := client.Get(url)
 		if err != nil {
 			return retry.RetryableError(err)
 		}

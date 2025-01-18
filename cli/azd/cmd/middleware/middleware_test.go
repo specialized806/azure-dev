@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/azure/azure-dev/cli/azd/cmd/actions"
-	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +18,7 @@ func Test_Middleware_RunAction(t *testing.T) {
 		runLog := []string{}
 
 		mockContext := mocks.NewMockContext(context.Background())
-		middlewareRunner := NewMiddlewareRunner(ioc.NewNestedContainer(nil))
+		middlewareRunner := NewMiddlewareRunner(mockContext.Container)
 
 		_ = middlewareRunner.Use("test", func() Middleware {
 			return &testMiddleware{
@@ -36,8 +35,8 @@ func Test_Middleware_RunAction(t *testing.T) {
 			}
 		})
 
-		action, actionRan := createAction(&runLog)
-		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, action)
+		actionRan := registerAction(t, mockContext, "test-action", &runLog)
+		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, "test-action")
 
 		require.NotNil(t, result)
 		require.NoError(t, err)
@@ -56,7 +55,7 @@ func Test_Middleware_RunAction(t *testing.T) {
 		runLog := []string{}
 
 		mockContext := mocks.NewMockContext(context.Background())
-		middlewareRunner := NewMiddlewareRunner(ioc.NewNestedContainer(nil))
+		middlewareRunner := NewMiddlewareRunner(mockContext.Container)
 
 		_ = middlewareRunner.Use("test", func() Middleware {
 			return &testMiddleware{
@@ -73,8 +72,8 @@ func Test_Middleware_RunAction(t *testing.T) {
 			}
 		})
 
-		action, actionRan := createAction(&runLog)
-		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, action)
+		actionRan := registerAction(t, mockContext, "test-action", &runLog)
+		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, "test-action")
 
 		require.Nil(t, result)
 		require.Error(t, err)
@@ -86,7 +85,7 @@ func Test_Middleware_RunAction(t *testing.T) {
 
 	t.Run("multiple middleware components", func(t *testing.T) {
 		mockContext := mocks.NewMockContext(context.Background())
-		middlewareRunner := NewMiddlewareRunner(ioc.NewNestedContainer(nil))
+		middlewareRunner := NewMiddlewareRunner(mockContext.Container)
 		runLog := []string{}
 
 		_ = middlewareRunner.Use("A", func() Middleware {
@@ -115,8 +114,8 @@ func Test_Middleware_RunAction(t *testing.T) {
 			}
 		})
 
-		action, actionRan := createAction(&runLog)
-		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, action)
+		actionRan := registerAction(t, mockContext, "test-action", &runLog)
+		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, "test-action")
 
 		require.NotNil(t, result)
 		require.NoError(t, err)
@@ -128,7 +127,7 @@ func Test_Middleware_RunAction(t *testing.T) {
 
 	t.Run("context propagated to action", func(t *testing.T) {
 		mockContext := mocks.NewMockContext(context.Background())
-		middlewareRunner := NewMiddlewareRunner(ioc.NewNestedContainer(nil))
+		middlewareRunner := NewMiddlewareRunner(mockContext.Container)
 
 		key := cxtKey{}
 
@@ -138,57 +137,48 @@ func Test_Middleware_RunAction(t *testing.T) {
 			})
 		})
 
-		action := actionFunc(func(ctx context.Context) (*actions.ActionResult, error) {
-			// ensure we can recover the value added by the middleware above.
+		err := mockContext.Container.RegisterNamedTransient("test-action", func() actions.Action {
+			return &testAction{
+				runFunc: func(ctx context.Context) (*actions.ActionResult, error) {
+					// ensure we can recover the value added by the middleware above.
+					a := ctx.Value(key)
+					require.NotNil(t, a)
 
-			a := ctx.Value(key)
-			require.NotNil(t, a)
+					v, ok := a.(string)
+					require.True(t, ok)
+					require.Equal(t, "pass", v)
 
-			v, ok := a.(string)
-			require.True(t, ok)
-			require.Equal(t, "pass", v)
-
-			return nil, nil
+					return nil, nil
+				},
+			}
 		})
+		require.NoError(t, err)
 
-		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, action)
+		result, err := middlewareRunner.RunAction(*mockContext.Context, &Options{Name: "test"}, "test-action")
 		require.Nil(t, result)
 		require.NoError(t, err)
 	})
 }
 
-func Test_Middleware_RunChildAction(t *testing.T) {
-	mockContext := mocks.NewMockContext(context.Background())
-	middlewareRunner := NewMiddlewareRunner(ioc.NewNestedContainer(nil))
-	runLog := []string{}
-
-	action, actionRan := createAction(&runLog)
-	runOptions := &Options{Name: "test"}
-
-	require.False(t, runOptions.IsChildAction())
-	result, err := middlewareRunner.RunChildAction(*mockContext.Context, runOptions, action)
-
-	// Executing RunChildAction sets a marker on the options that this is a child action
-	require.True(t, runOptions.IsChildAction())
-
-	require.NotNil(t, result)
-	require.NoError(t, err)
-	require.True(t, *actionRan)
-}
-
-func createAction(runLog *[]string) (actions.Action, *bool) {
+func registerAction(t *testing.T, mockContext *mocks.MockContext, name string, runLog *[]string) *bool {
 	actionRan := false
 
-	return &testAction{
-		runFunc: func(ctx context.Context) (*actions.ActionResult, error) {
-			actionRan = true
-			*runLog = append(*runLog, "action")
+	err := mockContext.Container.RegisterNamedTransient(name, func() actions.Action {
+		return &testAction{
+			runFunc: func(ctx context.Context) (*actions.ActionResult, error) {
+				actionRan = true
+				*runLog = append(*runLog, "action")
 
-			return &actions.ActionResult{
-				Message: &actions.ResultMessage{Header: "Action"},
-			}, nil
-		},
-	}, &actionRan
+				return &actions.ActionResult{
+					Message: &actions.ResultMessage{Header: "Action"},
+				}, nil
+			},
+		}
+	})
+
+	require.NoError(t, err)
+
+	return &actionRan
 }
 
 type testAction struct {
@@ -237,11 +227,4 @@ type middlewareFunc func(ctx context.Context, nextFn NextFn) (*actions.ActionRes
 
 func (f middlewareFunc) Run(ctx context.Context, nextFn NextFn) (*actions.ActionResult, error) {
 	return f(ctx, nextFn)
-}
-
-// actionFunc is a func that implements the actions.RunAction interface
-type actionFunc func(ctx context.Context) (*actions.ActionResult, error)
-
-func (f actionFunc) Run(ctx context.Context) (*actions.ActionResult, error) {
-	return f(ctx)
 }

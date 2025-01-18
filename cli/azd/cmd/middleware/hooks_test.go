@@ -14,7 +14,9 @@ import (
 	"github.com/azure/azure-dev/cli/azd/pkg/lazy"
 	"github.com/azure/azure-dev/cli/azd/pkg/project"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockenv"
 	"github.com/azure/azure-dev/cli/azd/test/ostest"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,20 +29,22 @@ func Test_CommandHooks_Middleware_WithValidProjectAndMatchingCommand(t *testing.
 
 	projectConfig := project.ProjectConfig{
 		Name: envName,
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"precommand": {
-				Run:   "echo 'hello'",
-				Shell: ext.ShellTypeBash,
+				{
+					Run:   "echo 'hello'",
+					Shell: ext.ShellTypeBash,
+				},
 			},
 		},
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	hookRan := setupHookMock(mockContext, 0)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -59,20 +63,22 @@ func Test_CommandHooks_Middleware_ValidProjectWithDifferentCommand(t *testing.T)
 
 	projectConfig := project.ProjectConfig{
 		Name: envName,
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"precommand": {
-				Run:   "echo 'hello'",
-				Shell: ext.ShellTypeBash,
+				{
+					Run:   "echo 'hello'",
+					Shell: ext.ShellTypeBash,
+				},
 			},
 		},
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	hookRan := setupHookMock(mockContext, 0)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -93,12 +99,12 @@ func Test_CommandHooks_Middleware_ValidProjectWithNoHooks(t *testing.T) {
 		Name: envName,
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	hookRan := setupHookMock(mockContext, 0)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -117,21 +123,23 @@ func Test_CommandHooks_Middleware_PreHookWithError(t *testing.T) {
 
 	projectConfig := project.ProjectConfig{
 		Name: envName,
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"precommand": {
-				Run:   "exit 1",
-				Shell: ext.ShellTypeBash,
+				{
+					Run:   "exit 1",
+					Shell: ext.ShellTypeBash,
+				},
 			},
 		},
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	// Set a non-zero exit code to simulate failure
 	hookRan := setupHookMock(mockContext, 1)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.Nil(t, result)
 	require.Error(t, err)
@@ -152,22 +160,24 @@ func Test_CommandHooks_Middleware_PreHookWithErrorAndContinue(t *testing.T) {
 
 	projectConfig := project.ProjectConfig{
 		Name: envName,
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"precommand": {
-				Run:             "exit 1",
-				Shell:           ext.ShellTypeBash,
-				ContinueOnError: true,
+				{
+					Run:             "exit 1",
+					Shell:           ext.ShellTypeBash,
+					ContinueOnError: true,
+				},
 			},
 		},
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	// Set a non-zero exit code to simulate failure
 	hookRan := setupHookMock(mockContext, 1)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -188,20 +198,22 @@ func Test_CommandHooks_Middleware_WithCmdAlias(t *testing.T) {
 
 	projectConfig := project.ProjectConfig{
 		Name: envName,
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"prealias": {
-				Run:   "echo 'hello'",
-				Shell: ext.ShellTypeBash,
+				{
+					Run:   "echo 'hello'",
+					Shell: ext.ShellTypeBash,
+				},
 			},
 		},
 	}
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	nextFn, actionRan := createNextFn()
 	hookRan := setupHookMock(mockContext, 0)
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -228,10 +240,12 @@ func Test_ServiceHooks_Registered(t *testing.T) {
 		Language:        "ts",
 		RelativePath:    "./src/api",
 		Host:            "appservice",
-		Hooks: map[string]*ext.HookConfig{
+		Hooks: map[string][]*ext.HookConfig{
 			"predeploy": {
-				Shell: ext.ShellTypeBash,
-				Run:   "echo 'Hello'",
+				{
+					Shell: ext.ShellTypeBash,
+					Run:   "echo 'Hello'",
+				},
 			},
 		},
 	}
@@ -247,7 +261,7 @@ func Test_ServiceHooks_Registered(t *testing.T) {
 		return exec.NewRunResult(0, "", ""), nil
 	})
 
-	err := ensureAzdValid(*mockContext.Context, azdContext, envName, &projectConfig)
+	err := ensureAzdValid(mockContext, azdContext, envName, &projectConfig)
 	require.NoError(t, err)
 
 	projectConfig.Services["api"].Project = &projectConfig
@@ -263,7 +277,7 @@ func Test_ServiceHooks_Registered(t *testing.T) {
 		return &actions.ActionResult{}, err
 	}
 
-	result, err := runMiddleware(mockContext, azdContext, envName, &projectConfig, &runOptions, nextFn)
+	result, err := runMiddleware(mockContext, envName, &projectConfig, &runOptions, nextFn)
 
 	require.NotNil(t, result)
 	require.NoError(t, err)
@@ -313,13 +327,21 @@ func setupHookMock(mockContext *mocks.MockContext, exitCode int) *bool {
 
 func runMiddleware(
 	mockContext *mocks.MockContext,
-	azdContext *azdcontext.AzdContext,
 	envName string,
 	projectConfig *project.ProjectConfig,
 	runOptions *Options,
 	nextFn NextFn,
 ) (*actions.ActionResult, error) {
-	env := environment.EphemeralWithValues(envName, nil)
+	env := environment.NewWithValues(envName, nil)
+
+	// Setup environment mocks for save & reload
+	envManager := &mockenv.MockEnvManager{}
+	envManager.On("Save", mock.Anything, mock.Anything).Return(nil)
+	envManager.On("Reload", mock.Anything, mock.Anything).Return(nil)
+
+	lazyEnvManager := lazy.NewLazy(func() (environment.Manager, error) {
+		return envManager, nil
+	})
 
 	lazyEnv := lazy.NewLazy(func() (*environment.Environment, error) {
 		return env, nil
@@ -330,8 +352,10 @@ func runMiddleware(
 	})
 
 	middleware := NewHooksMiddleware(
+		lazyEnvManager,
 		lazyEnv,
 		lazyProjectConfig,
+		project.NewImportManager(nil),
 		mockContext.CommandRunner,
 		mockContext.Console,
 		runOptions,
@@ -345,33 +369,30 @@ func runMiddleware(
 // Helper functions below
 
 func ensureAzdValid(
-	ctx context.Context,
+	mockContext *mocks.MockContext,
 	azdContext *azdcontext.AzdContext,
 	envName string,
 	projectConfig *project.ProjectConfig,
 ) error {
-	err := ensureAzdEnv(azdContext, envName)
+	envManager := &mockenv.MockEnvManager{}
+	envManager.On("Save", mock.Anything, mock.Anything).Return(nil)
+	envManager.On("Reload", mock.Anything, mock.Anything).Return(nil)
+
+	err := ensureAzdEnv(*mockContext.Context, envManager, envName)
 	if err != nil {
 		return err
 	}
 
-	if err := ensureAzdProject(ctx, azdContext, projectConfig); err != nil {
+	if err := ensureAzdProject(*mockContext.Context, azdContext, projectConfig); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func ensureAzdEnv(azdContext *azdcontext.AzdContext, envName string) error {
-	err := azdContext.NewEnvironment(envName)
-	if err != nil {
-		return err
-	}
-
-	env := environment.EmptyWithRoot(azdContext.EnvironmentRoot(envName))
-	env.SetEnvName(envName)
-
-	err = env.Save()
+func ensureAzdEnv(ctx context.Context, envManager environment.Manager, envName string) error {
+	env := environment.New(envName)
+	err := envManager.Save(ctx, env)
 	if err != nil {
 		return err
 	}

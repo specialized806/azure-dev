@@ -11,7 +11,7 @@ import { fileExists } from '../utils/fileUtils';
 
 const AzureYamlGlobPattern: vscode.GlobPattern = '**/[aA][zZ][uU][rR][eE].[yY][aA][mM][lL]';
 
-// If the command was invoked with a specific file context, use the file context as the working directory for running Azure dev CLI commands.
+// If the command was invoked with a specific file context, use the file context as the working directory for running Azure developer CLI commands.
 // Otherwise search the workspace for "azure.yaml" files. If only one is found, use it (i.e. its folder). If more than one is found, ask the user which one to use.
 // If at this point we still do not have a working directory, prompt the user to select one.
 export async function getWorkingFolder(context: IActionContext, selectedFile?: vscode.Uri): Promise<string> {
@@ -54,7 +54,7 @@ export async function pickAzureYamlFile(context: IActionContext): Promise<vscode
     let filePath: vscode.Uri | undefined = undefined;
 
     const azureYamlFileUris = await vscode.workspace.findFiles(AzureYamlGlobPattern);
-        
+
     if (azureYamlFileUris && azureYamlFileUris.length > 0) {
         if (azureYamlFileUris.length > 1) {
             const choices: IAzureQuickPickItem<vscode.Uri>[] = azureYamlFileUris.map(u => { return {
@@ -91,7 +91,7 @@ export async function selectApplicationTemplate(context: IActionContext): Promis
         .withArg('template').withArg('list')
         .withArg('--output').withArg('json')
         .build();
-    const result = await execAsync(command);
+    const result = await execAsync(command, azureCli.spawnOptions());
     const templates = JSON.parse(result.stdout) as { name: string, description: string, repositoryPath: string }[];
     const choices = templates.map(t => { return { label: t.name, detail: t.description, data: t.repositoryPath } as IAzureQuickPickItem<string>; });
     choices.unshift({ label: vscode.l10n.t('Use another template...'), data: '', id: UseCustomTemplate });
@@ -116,6 +116,8 @@ export async function selectApplicationTemplate(context: IActionContext): Promis
 export type EnvironmentInfo = {
     Name: string,
     IsDefault: boolean,
+    HasLocal?: boolean,
+    HasRemote?: boolean,
     DotEnvPath: string
 };
 

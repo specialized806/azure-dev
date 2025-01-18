@@ -5,12 +5,12 @@ package cmd
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -82,7 +82,7 @@ func getCmdHelpDefaultDescription(cmd *cobra.Command) string {
 // getCmdHelpDefaultUsage provides the default implementation for displaying the help usage section.
 func getCmdHelpDefaultUsage(cmd *cobra.Command) string {
 	return fmt.Sprintf("%s\n  %s\n\n",
-		output.WithBold(output.WithUnderline("Usage")),
+		output.WithBold("%s", output.WithUnderline("Usage")),
 		"{{if .Runnable}}{{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}{{.CommandPath}} [command]{{end}}",
 	)
 }
@@ -94,17 +94,39 @@ func getCmdHelpDefaultCommands(cmd *cobra.Command) string {
 
 // getCmdHelpDefaultFlags provides the default implementation for displaying the help flags section.
 func getCmdHelpDefaultFlags(cmd *cobra.Command) (result string) {
-	if cmd.HasAvailableLocalFlags() {
-		flags := getFlagsDetails(cmd.LocalFlags())
-		result = fmt.Sprintf("%s\n%s\n",
-			output.WithBold(output.WithUnderline("Flags")),
-			flags)
+	// force the following flags as global flags for display purposes when displaying help.
+	forceGlobalFlagNames := map[string]struct{}{
+		"help": {},
+		"docs": {},
 	}
-	if cmd.HasAvailableInheritedFlags() {
-		globalFlags := getFlagsDetails(cmd.InheritedFlags())
+
+	forceGlobalFlags := pflag.NewFlagSet("", pflag.ContinueOnError)
+	localFlags := pflag.NewFlagSet("", pflag.ContinueOnError)
+
+	cmd.LocalFlags().VisitAll(func(f *pflag.Flag) {
+		if _, ok := forceGlobalFlagNames[f.Name]; ok {
+			forceGlobalFlags.AddFlag(f)
+		} else {
+			localFlags.AddFlag(f)
+		}
+	})
+
+	if localFlags.HasAvailableFlags() {
+		details := getFlagsDetails(localFlags)
+		result = fmt.Sprintf("%s\n%s\n",
+			output.WithBold("%s", output.WithUnderline("Flags")),
+			details)
+	}
+
+	globalFlags := pflag.NewFlagSet("", pflag.ContinueOnError)
+	globalFlags.AddFlagSet(cmd.InheritedFlags())
+	globalFlags.AddFlagSet(forceGlobalFlags)
+
+	if globalFlags.HasAvailableFlags() {
+		details := getFlagsDetails(globalFlags)
 		result += fmt.Sprintf("%s\n%s\n",
-			output.WithBold(output.WithUnderline("Global Flags")),
-			globalFlags)
+			output.WithBold("%s", output.WithUnderline("Global Flags")),
+			details)
 	}
 	return result
 }
@@ -128,7 +150,7 @@ func getCmdHelpCommands(title string, commands string) string {
 	if commands == "" {
 		return commands
 	}
-	return fmt.Sprintf("%s\n%s\n", output.WithBold(output.WithUnderline(title)), commands)
+	return fmt.Sprintf("%s\n%s\n", output.WithBold("%s", output.WithUnderline("%s", title)), commands)
 }
 
 // getCmdHelpGroupedCommands generates {{ commands - description }} where sub-commands are grouped.
@@ -139,20 +161,6 @@ func getCmdHelpGroupedCommands(commands string) string {
 // getCmdHelpAvailableCommands generates {{ commands - description }} for all sub-commands.
 func getCmdHelpAvailableCommands(commands string) string {
 	return getCmdHelpCommands("Available Commands", commands)
-}
-
-// getCmdHelpDescriptionNoteForInit produces help - description - notes for commands which initialize azd (i.e. up, init)
-func getCmdHelpDescriptionNoteForInit(c *cobra.Command) (notes []string) {
-	notes = append(notes, formatHelpNote(
-		fmt.Sprintf("Running %s without a template will prompt "+
-			"you to start with an empty template or select from a curated list of presets.",
-			output.WithHighLightFormat(c.CommandPath()),
-		)))
-	notes = append(notes, formatHelpNote(
-		fmt.Sprintf("To view all currently available sample templates visit: %s.",
-			output.WithHighLightFormat(c.CommandPath()),
-		)))
-	return notes
 }
 
 // getFlagsDetails produces the command - flags - details in the form of `-F, --flag [type] : description`
@@ -294,7 +302,7 @@ func generateCmdHelpSamplesBlock(samples map[string]string) string {
 	// sorting lines to keep a deterministic output, as map[string]string is not ordered
 	slices.Sort(lines)
 	return fmt.Sprintf("%s\n%s\n",
-		output.WithBold(output.WithUnderline("Examples")),
+		output.WithBold("%s", output.WithUnderline("Examples")),
 		strings.Join(lines, "\n\n"),
 	)
 }

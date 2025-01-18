@@ -9,21 +9,29 @@ Usage
   azd package <service> [flags]
 
 Flags
-        --all                	: Deploys all services that are listed in azure.yaml
+        --all                	: Packages all services that are listed in azure.yaml
     -e, --environment string 	: The name of the environment to use.
-    -h, --help               	: Gets help for package.
+        --output-path string 	: File or folder path where the generated packages will be saved.
 
 Global Flags
     -C, --cwd string 	: Sets the current working directory.
         --debug      	: Enables debugging and diagnostics logging.
+        --docs       	: Opens the documentation for azd package in your web browser.
+    -h, --help       	: Gets help for package.
         --no-prompt  	: Accepts the default value instead of prompting, or it fails if there is no default.
 
 Examples
   Packages all services in the current project to Azure.
     azd package --all
 
+  Packages all services to the specified output path.
+    azd package --output-path ./dist
+
   Packages the service named 'api' to Azure.
     azd package api
+
+  Packages the service named 'api' to the specified output path.
+    azd package api --output-path ./dist/api.zip
 
   Packages the service named 'web' to Azure.
     azd package web

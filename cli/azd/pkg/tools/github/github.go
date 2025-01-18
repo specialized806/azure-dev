@@ -21,8 +21,6 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry/events"
 	"github.com/azure/azure-dev/cli/azd/pkg/config"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
@@ -31,27 +29,15 @@ import (
 	"github.com/blang/semver/v4"
 )
 
-type GitHubCli interface {
-	tools.ExternalTool
-	GetAuthStatus(ctx context.Context, hostname string) (AuthStatus, error)
-	ListSecrets(ctx context.Context, repo string) error
-	SetSecret(ctx context.Context, repo string, name string, value string) error
-	Login(ctx context.Context, hostname string) error
-	ListRepositories(ctx context.Context) ([]GhCliRepository, error)
-	ViewRepository(ctx context.Context, name string) (GhCliRepository, error)
-	CreatePrivateRepository(ctx context.Context, name string) error
-	GetGitProtocolType(ctx context.Context) (string, error)
-	GitHubActionsExists(ctx context.Context, repoSlug string) (bool, error)
-	BinaryPath() string
-}
+var _ tools.ExternalTool = (*Cli)(nil)
 
-func NewGitHubCli(ctx context.Context, console input.Console, commandRunner exec.CommandRunner) (GitHubCli, error) {
+func NewGitHubCli(ctx context.Context, console input.Console, commandRunner exec.CommandRunner) (*Cli, error) {
 	return newGitHubCliImplementation(ctx, console, commandRunner, http.DefaultClient, downloadGh, extractGhCli)
 }
 
-// cGitHubCliVersion is the minimum version of GitHub cli that we require (and the one we fetch when we fetch bicep on
+// Version is the minimum version of GitHub cli that we require (and the one we fetch when we fetch gh on
 // behalf of a user).
-var cGitHubCliVersion semver.Version = semver.MustParse("2.22.1")
+var Version semver.Version = semver.MustParse("2.55.0")
 
 // newGitHubCliImplementation is like NewGitHubCli but allows providing a custom transport to use when downloading the
 // GitHub CLI, for testing purposes.
@@ -62,14 +48,16 @@ func newGitHubCliImplementation(
 	transporter policy.Transporter,
 	acquireGitHubCliImpl getGitHubCliImplementation,
 	extractImplementation extractGitHubCliFromFileImplementation,
-) (GitHubCli, error) {
-	if override := os.Getenv("AZD_GH_CLI_TOOL_PATH"); override != "" {
+) (*Cli, error) {
+	if override := os.Getenv("AZD_GH_TOOL_PATH"); override != "" {
 		log.Printf("using external github cli tool: %s", override)
-
-		return &ghCli{
+		cli := &Cli{
 			path:          override,
 			commandRunner: commandRunner,
-		}, nil
+		}
+		cli.logVersion(ctx)
+
+		return cli, nil
 	}
 
 	githubCliPath, err := azdGithubCliPath()
@@ -80,24 +68,29 @@ func newGitHubCliImplementation(
 	if _, err = os.Stat(githubCliPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("getting file information from github cli default path: %w", err)
 	}
-	if errors.Is(err, os.ErrNotExist) {
+	var installGhCli bool
+	if errors.Is(err, os.ErrNotExist) || !expectedVersionInstalled(ctx, commandRunner, githubCliPath) {
+		installGhCli = true
+	}
+	if installGhCli {
 		if err := os.MkdirAll(filepath.Dir(githubCliPath), osutil.PermissionDirectory); err != nil {
 			return nil, fmt.Errorf("creating github cli default path: %w", err)
 		}
 
 		msg := "setting up github connection"
 		console.ShowSpinner(ctx, msg, input.Step)
-		err = acquireGitHubCliImpl(ctx, transporter, cGitHubCliVersion, extractImplementation, githubCliPath)
+		err = acquireGitHubCliImpl(ctx, transporter, Version, extractImplementation, githubCliPath)
 		console.StopSpinner(ctx, "", input.Step)
 		if err != nil {
 			return nil, fmt.Errorf("setting up github connection: %w", err)
 		}
 	}
 
-	cli := &ghCli{
+	cli := &Cli{
 		path:          githubCliPath,
 		commandRunner: commandRunner,
 	}
+	cli.logVersion(ctx)
 	return cli, nil
 }
 
@@ -107,12 +100,14 @@ func azdGithubCliPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return filepath.Join(configDir, "bin", ghCliName()), nil
+}
 
+func ghCliName() string {
 	if runtime.GOOS == "windows" {
-		return filepath.Join(configDir, "bin", "gh.exe"), nil
+		return "gh.exe"
 	}
-
-	return filepath.Join(configDir, "bin", "gh"), nil
+	return "gh"
 }
 
 var (
@@ -128,24 +123,42 @@ var (
 	TokenEnvVars = []string{"GITHUB_TOKEN", "GH_TOKEN"}
 )
 
-type ghCli struct {
+type Cli struct {
 	commandRunner exec.CommandRunner
 	path          string
 }
 
-func (cli *ghCli) CheckInstalled(ctx context.Context) (bool, error) {
-	return true, nil
+func (cli *Cli) CheckInstalled(ctx context.Context) error {
+	return nil
 }
 
-func (cli *ghCli) Name() string {
+func expectedVersionInstalled(ctx context.Context, commandRunner exec.CommandRunner, binaryPath string) bool {
+	ghVersion, err := tools.ExecuteCommand(ctx, commandRunner, binaryPath, "--version")
+	if err != nil {
+		log.Printf("checking GitHub CLI version: %s", err.Error())
+		return false
+	}
+	ghSemver, err := tools.ExtractVersion(ghVersion)
+	if err != nil {
+		log.Printf("converting to semver version fails: %s", err.Error())
+		return false
+	}
+	if ghSemver.LT(Version) {
+		log.Printf("Found gh cli version %s. Expected version: %s.", ghSemver.String(), Version.String())
+		return false
+	}
+	return true
+}
+
+func (cli *Cli) Name() string {
 	return "GitHub CLI"
 }
 
-func (cli *ghCli) BinaryPath() string {
+func (cli *Cli) BinaryPath() string {
 	return cli.path
 }
 
-func (cli *ghCli) InstallUrl() string {
+func (cli *Cli) InstallUrl() string {
 	return "https://aka.ms/azure-dev/github-cli-install"
 }
 
@@ -154,52 +167,154 @@ type AuthStatus struct {
 	LoggedIn bool
 }
 
-func (cli *ghCli) GetAuthStatus(ctx context.Context, hostname string) (AuthStatus, error) {
+func (cli *Cli) GetAuthStatus(ctx context.Context, hostname string) (AuthStatus, error) {
 	runArgs := cli.newRunArgs("auth", "status", "--hostname", hostname)
 	res, err := cli.commandRunner.Run(ctx, runArgs)
-	if res.ExitCode == 0 {
+	if err == nil {
 		authResult := AuthStatus{LoggedIn: true}
 		return authResult, nil
-	} else if isGhCliNotLoggedInMessageRegex.MatchString(res.Stderr) {
+	}
+
+	if isGhCliNotLoggedInMessageRegex.MatchString(res.Stderr) {
 		return AuthStatus{}, nil
 	} else if notLoggedIntoAnyGitHubHostsMessageRegex.MatchString(res.Stderr) {
 		return AuthStatus{}, nil
-	} else if err != nil {
-		return AuthStatus{}, fmt.Errorf("failed running gh auth status %s: %w", res.String(), err)
 	}
 
-	return AuthStatus{}, errors.New("could not determine auth status")
+	return AuthStatus{}, fmt.Errorf("failed running gh auth status: %w", err)
 }
 
-func (cli *ghCli) Login(ctx context.Context, hostname string) error {
+func (cli *Cli) Login(ctx context.Context, hostname string) error {
 	runArgs := cli.newRunArgs("auth", "login", "--hostname", hostname, "--scopes", "repo,workflow").
 		WithInteractive(true)
 
-	res, err := cli.commandRunner.Run(ctx, runArgs)
+	_, err := cli.commandRunner.Run(ctx, runArgs)
 
 	if err != nil {
-		return fmt.Errorf("failed running gh auth login %s: %w", res.String(), err)
+		return fmt.Errorf("failed running gh auth login: %w", err)
 	}
 
 	return nil
 }
 
-func (cli *ghCli) ListSecrets(ctx context.Context, repoSlug string) error {
+// ApiCallOptions represent the options for the ApiCall method.
+type ApiCallOptions struct {
+	Headers []string
+}
+
+// ApiCall uses gh cli to call https://api.<hostname>/<path>.
+func (cli *Cli) ApiCall(ctx context.Context, hostname, path string, options ApiCallOptions) (string, error) {
+	url := fmt.Sprintf("https://api.%s%s", hostname, path)
+	args := []string{"api", url}
+	for _, header := range options.Headers {
+		args = append(args, "-H", header)
+	}
+	// application/vnd.github.raw makes the API return the raw content of the file
+	runArgs := cli.newRunArgs(args...)
+	result, err := cli.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("failed running gh api: %s: %w", url, err)
+	}
+
+	return result.Stdout, nil
+}
+
+func ghOutputToList(output string) []string {
+	lines := strings.Split(output, "\n")
+	result := make([]string, len(lines)-1)
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		valueParts := strings.Split(line, "\t")
+		result[i] = valueParts[0]
+	}
+	return result
+}
+
+func (cli *Cli) ListSecrets(ctx context.Context, repoSlug string) ([]string, error) {
 	runArgs := cli.newRunArgs("-R", repoSlug, "secret", "list")
-	res, err := cli.run(ctx, runArgs)
+	output, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return fmt.Errorf("failed running gh secret list %s: %w", res.String(), err)
+		return nil, fmt.Errorf("failed running gh secret list: %w", err)
+	}
+	return ghOutputToList(output.Stdout), nil
+}
+
+func (cli *Cli) ListVariables(ctx context.Context, repoSlug string) ([]string, error) {
+	runArgs := cli.newRunArgs("-R", repoSlug, "variable", "list")
+	output, err := cli.run(ctx, runArgs)
+	if err != nil {
+		return nil, fmt.Errorf("failed running gh secret list: %w", err)
+	}
+	return ghOutputToList(output.Stdout), nil
+}
+
+func (cli *Cli) SetSecret(ctx context.Context, repoSlug string, name string, value string) error {
+	runArgs := cli.newRunArgs("-R", repoSlug, "secret", "set", name).WithStdIn(strings.NewReader(value))
+	_, err := cli.run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("failed running gh secret set: %w", err)
 	}
 	return nil
 }
 
-func (cli *ghCli) SetSecret(ctx context.Context, repoSlug string, name string, value string) error {
-	runArgs := cli.newRunArgs("-R", repoSlug, "secret", "set", name, "--body", value)
-	res, err := cli.run(ctx, runArgs)
+func (cli *Cli) SetVariable(ctx context.Context, repoSlug string, name string, value string) error {
+	runArgs := cli.newRunArgs("-R", repoSlug, "variable", "set", name).WithStdIn(strings.NewReader(value))
+	_, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return fmt.Errorf("failed running gh secret set %s: %w", res.String(), err)
+		return fmt.Errorf("failed running gh variable set: %w", err)
 	}
 	return nil
+}
+
+func (cli *Cli) DeleteSecret(ctx context.Context, repoSlug string, name string) error {
+	runArgs := cli.newRunArgs("-R", repoSlug, "secret", "delete", name)
+	_, err := cli.run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("failed running gh secret delete: %w", err)
+	}
+	return nil
+}
+
+func (cli *Cli) DeleteVariable(ctx context.Context, repoSlug string, name string) error {
+	runArgs := cli.newRunArgs("-R", repoSlug, "variable", "delete", name)
+	_, err := cli.run(ctx, runArgs)
+	if err != nil {
+		return fmt.Errorf("failed running gh variable delete: %w", err)
+	}
+	return nil
+}
+
+// ghCliVersionRegexp fetches the version number from the output of gh --version, which looks like this:
+//
+// gh version 2.6.0 (2022-03-15)
+// https://github.com/cli/cli/releases/tag/v2.6.0
+var ghCliVersionRegexp = regexp.MustCompile(`gh version ([0-9]+\.[0-9]+\.[0-9]+)`)
+
+// logVersion writes the version of the GitHub CLI to the debug log for diagnostics purposes, or an error if
+// it could not be determined
+func (cli *Cli) logVersion(ctx context.Context) {
+	if ver, err := cli.extractVersion(ctx); err == nil {
+		log.Printf("github cli version: %s", ver)
+	} else {
+		log.Printf("could not determine github cli version: %s", err)
+	}
+}
+
+// extractVersion gets the version of the GitHub CLI, from the output of `gh --version`
+func (cli *Cli) extractVersion(ctx context.Context) (string, error) {
+	runArgs := cli.newRunArgs("--version")
+	res, err := cli.run(ctx, runArgs)
+	if err != nil {
+		return "", fmt.Errorf("error running gh --version: %w", err)
+	}
+
+	matches := ghCliVersionRegexp.FindStringSubmatch(res.Stdout)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("could not extract version from output: %s", res.Stdout)
+	}
+	return matches[1], nil
 }
 
 type GhCliRepository struct {
@@ -211,45 +326,46 @@ type GhCliRepository struct {
 	SshUrl string
 }
 
-func (cli *ghCli) ListRepositories(ctx context.Context) ([]GhCliRepository, error) {
+func (cli *Cli) ListRepositories(ctx context.Context) ([]GhCliRepository, error) {
 	runArgs := cli.newRunArgs("repo", "list", "--no-archived", "--json", "nameWithOwner,url,sshUrl")
 	res, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return nil, fmt.Errorf("failed running gh repo list %s: %w", res.String(), err)
+		return nil, fmt.Errorf("failed running gh repo list: %w", err)
 	}
 
 	var repos []GhCliRepository
 
 	if err := json.Unmarshal([]byte(res.Stdout), &repos); err != nil {
-		return nil, fmt.Errorf("could not unmarshal output %s as a []GhCliRepository: %w", res.Stdout, err)
+		return nil, fmt.Errorf("could not unmarshal output as a []GhCliRepository: %w, output: %s", err, res.Stdout)
 	}
 
 	return repos, nil
 }
 
-func (cli *ghCli) ViewRepository(ctx context.Context, name string) (GhCliRepository, error) {
+func (cli *Cli) ViewRepository(ctx context.Context, name string) (GhCliRepository, error) {
 	runArgs := cli.newRunArgs("repo", "view", name, "--json", "nameWithOwner,url,sshUrl")
 	res, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return GhCliRepository{}, fmt.Errorf("failed running gh repo list %s: %w", res.String(), err)
+		return GhCliRepository{}, fmt.Errorf("failed running gh repo list: %w", err)
 	}
 
 	var repo GhCliRepository
 
 	if err := json.Unmarshal([]byte(res.Stdout), &repo); err != nil {
-		return GhCliRepository{}, fmt.Errorf("could not unmarshal output %s as a GhCliRepository: %w", res.Stdout, err)
+		return GhCliRepository{},
+			fmt.Errorf("could not unmarshal output as a GhCliRepository: %w, output: %s", err, res.Stdout)
 	}
 
 	return repo, nil
 }
 
-func (cli *ghCli) CreatePrivateRepository(ctx context.Context, name string) error {
+func (cli *Cli) CreatePrivateRepository(ctx context.Context, name string) error {
 	runArgs := cli.newRunArgs("repo", "create", name, "--private")
 	res, err := cli.run(ctx, runArgs)
 	if repositoryNameInUseRegex.MatchString(res.Stderr) {
 		return ErrRepositoryNameInUse
 	} else if err != nil {
-		return fmt.Errorf("failed running gh repo create %s: %w", res.String(), err)
+		return fmt.Errorf("failed running gh repo create: %w", err)
 	}
 
 	return nil
@@ -260,11 +376,11 @@ const (
 	GitHttpsProtocolType = "https"
 )
 
-func (cli *ghCli) GetGitProtocolType(ctx context.Context) (string, error) {
+func (cli *Cli) GetGitProtocolType(ctx context.Context) (string, error) {
 	runArgs := cli.newRunArgs("config", "get", "git_protocol")
 	res, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return "", fmt.Errorf("failed running gh config get git_protocol %s: %w", res.String(), err)
+		return "", fmt.Errorf("failed running gh config get git_protocol: %w", err)
 	}
 
 	return strings.TrimSpace(res.Stdout), nil
@@ -276,15 +392,15 @@ type GitHubActionsResponse struct {
 
 // GitHubActionsExists gets the information from upstream about the workflows and
 // return true if there is at least one workflow in the repo.
-func (cli *ghCli) GitHubActionsExists(ctx context.Context, repoSlug string) (bool, error) {
+func (cli *Cli) GitHubActionsExists(ctx context.Context, repoSlug string) (bool, error) {
 	runArgs := cli.newRunArgs("api", "/repos/"+repoSlug+"/actions/workflows")
 	res, err := cli.run(ctx, runArgs)
 	if err != nil {
-		return false, fmt.Errorf("getting github actions %s: %w", res.String(), err)
+		return false, fmt.Errorf("getting github actions: %w", err)
 	}
 	var jsonResponse GitHubActionsResponse
 	if err := json.Unmarshal([]byte(res.Stdout), &jsonResponse); err != nil {
-		return false, fmt.Errorf("could not unmarshal output %s as a GhActionsResponse: %w", res.Stdout, err)
+		return false, fmt.Errorf("could not unmarshal output as a GhActionsResponse: %w, output: %s", err, res.Stdout)
 	}
 	if jsonResponse.TotalCount == 0 {
 		return false, nil
@@ -292,17 +408,17 @@ func (cli *ghCli) GitHubActionsExists(ctx context.Context, repoSlug string) (boo
 	return true, nil
 }
 
-func (cli *ghCli) newRunArgs(args ...string) exec.RunArgs {
+func (cli *Cli) newRunArgs(args ...string) exec.RunArgs {
 
 	runArgs := exec.NewRunArgs(cli.path, args...)
-	if os.Getenv("CODESPACES") == "true" {
+	if RunningOnCodespaces() {
 		runArgs = runArgs.WithEnv([]string{"GITHUB_TOKEN=", "GH_TOKEN="})
 	}
 
 	return runArgs
 }
 
-func (cli *ghCli) run(ctx context.Context, runArgs exec.RunArgs) (exec.RunResult, error) {
+func (cli *Cli) run(ctx context.Context, runArgs exec.RunArgs) (exec.RunResult, error) {
 	res, err := cli.commandRunner.Run(ctx, runArgs)
 	if isGhCliNotLoggedInMessageRegex.MatchString(res.Stderr) {
 		return res, ErrGitHubCliNotLoggedIn
@@ -319,10 +435,10 @@ func (cli *ghCli) run(ctx context.Context, runArgs exec.RunArgs) (exec.RunResult
 var isGhCliNotLoggedInMessageRegex = regexp.MustCompile(
 	"(To authenticate, please run `gh auth login`\\.)|(Try authenticating with:  gh auth login)|(To re-authenticate, run: gh auth login)|(To get started with GitHub CLI, please run:  gh auth login)",
 )
-var repositoryNameInUseRegex = regexp.MustCompile("GraphQL: Name already exists on this account (createRepository)")
+var repositoryNameInUseRegex = regexp.MustCompile(`GraphQL: Name already exists on this account \(createRepository\)`)
 
 var notLoggedIntoAnyGitHubHostsMessageRegex = regexp.MustCompile(
-	"You are not logged into any GitHub hosts. Run gh auth login to authenticate.",
+	"You are not logged into any GitHub hosts.",
 )
 
 var isUserNotAuthorizedMessageRegex = regexp.MustCompile(
@@ -335,17 +451,18 @@ func extractFromZip(src, dst string) (string, error) {
 		return "", err
 	}
 
+	log.Printf("extract from zip %s", src)
 	defer zipReader.Close()
 
 	var extractedAt string
 	for _, file := range zipReader.File {
-		if !file.FileInfo().IsDir() && strings.Contains(file.Name, "gh") {
+		fileName := file.FileInfo().Name()
+		if !file.FileInfo().IsDir() && fileName == ghCliName() {
+			log.Printf("found cli at: %s", file.Name)
 			fileReader, err := file.Open()
 			if err != nil {
 				return extractedAt, err
 			}
-			fileNameParts := strings.Split(file.Name, "/")
-			fileName := fileNameParts[len(fileNameParts)-1]
 			filePath := filepath.Join(dst, fileName)
 			ghCliFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
 			if err != nil {
@@ -362,6 +479,7 @@ func extractFromZip(src, dst string) (string, error) {
 		}
 	}
 	if extractedAt != "" {
+		log.Printf("extracted to: %s", extractedAt)
 		return extractedAt, nil
 	}
 	return extractedAt, fmt.Errorf("github cli binary was not found within the zip file")
@@ -399,7 +517,7 @@ func extractFromTar(src, dst string) (string, error) {
 		// cspell: disable-next-line `Typeflag` is comming fron *tar.Header
 		if fileHeader.Typeflag == tar.TypeReg && fileName == "gh" {
 			filePath := filepath.Join(dst, fileName)
-			ghCliFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(fileHeader.Mode))
+			ghCliFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileHeader.FileInfo().Mode())
 			if err != nil {
 				return extractedAt, err
 			}
@@ -449,28 +567,30 @@ func downloadGh(
 	extractImplementation extractGitHubCliFromFileImplementation,
 	path string) error {
 
+	binaryName := func(platform string) string {
+		return fmt.Sprintf("gh_%s_%s", ghVersion, platform)
+	}
+
+	systemArch := runtime.GOARCH
 	// arm and x86 not supported (similar to bicep)
 	var releaseName string
 	switch runtime.GOOS {
 	case "windows":
-		releaseName = "gh_2.22.1_windows_amd64.zip"
+		releaseName = binaryName(fmt.Sprintf("windows_%s.zip", systemArch))
 	case "darwin":
-		releaseName = "gh_2.22.1_macOS_amd64.tar.gz"
+		releaseName = binaryName(fmt.Sprintf("macOS_%s.zip", systemArch))
 	case "linux":
-		releaseName = "gh_2.22.1_linux_amd64.tar.gz"
+		releaseName = binaryName(fmt.Sprintf("linux_%s.tar.gz", systemArch))
 	default:
 		return fmt.Errorf("unsupported platform")
 	}
 
-	//https://github.com/cli/cli/releases/download/v2.22.1/gh_2.22.1_linux_arm64.rpm
+	// example: https://github.com/cli/cli/releases/download/v2.55.0/gh_2.55.0_linux_arm64.rpm
 	ghReleaseUrl := fmt.Sprintf("https://github.com/cli/cli/releases/download/v%s/%s", ghVersion, releaseName)
 
 	log.Printf("downloading github cli release %s -> %s", ghReleaseUrl, releaseName)
 
-	spanCtx, span := telemetry.GetTracer().Start(ctx, events.GitHubCliInstallEvent)
-	defer span.End()
-
-	req, err := http.NewRequestWithContext(spanCtx, "GET", ghReleaseUrl, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", ghReleaseUrl, nil)
 	if err != nil {
 		return err
 	}
@@ -507,14 +627,21 @@ func downloadGh(
 		return err
 	}
 	defer func() {
+		log.Printf("delete %s", compressedFileName)
 		_ = os.Remove(compressedFileName)
 	}()
 
 	// unzip downloaded file
+	log.Printf("extracting file %s", compressedFileName)
 	_, err = extractImplementation(compressedFileName, tmpPath)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// RunningOnCodespaces check if the application is running on codespaces.
+func RunningOnCodespaces() bool {
+	return os.Getenv("CODESPACES") == "true"
 }

@@ -15,8 +15,9 @@ import (
 	"time"
 
 	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/internal/runcontext"
 	appinsightsexporter "github.com/azure/azure-dev/cli/azd/internal/telemetry/appinsights-exporter"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry/resource"
+	"github.com/azure/azure-dev/cli/azd/internal/tracing/resource"
 	"github.com/azure/azure-dev/cli/azd/pkg/config"
 	"github.com/benbjohnson/clock"
 	"github.com/gofrs/flock"
@@ -65,7 +66,17 @@ func getTelemetryDirectory() (string, error) {
 }
 
 func IsTelemetryEnabled() bool {
-	return os.Getenv(collectTelemetryEnvVar) != "no"
+	// If the user has opted out of telemetry directly, don't collect telemetry.
+	if os.Getenv(collectTelemetryEnvVar) == "no" {
+		return false
+	}
+
+	// If it's the first run and we're in cloud shell, don't collect telemetry.
+	if noticeShown() && runcontext.IsRunningInCloudShell() {
+		return false
+	}
+
+	return true
 }
 
 // Returns the singleton TelemetrySystem instance.
@@ -82,9 +93,6 @@ func GetTelemetrySystem() *TelemetrySystem {
 
 	return instance
 }
-
-// ref: go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/otlpconfig/DefaultCollectorHTTPPort
-const cDefaultCollectorHTTPPort uint16 = 4318
 
 func initialize() (*TelemetrySystem, error) {
 	if !IsTelemetryEnabled() {
@@ -145,7 +153,7 @@ func initialize() (*TelemetrySystem, error) {
 
 		// As a convenience we allow using localhost as an alias for http://localhost so that
 		// --trace-log-url localhost behaves as expected (for folks who are running something like Jaeger's all-in-one
-		// docker image locally.)
+		// Docker image locally.)
 		if logUrl == "localhost" {
 			logUrl = "http://localhost"
 		}
@@ -166,7 +174,8 @@ func initialize() (*TelemetrySystem, error) {
 		if u.Port() != "" {
 			traceOptions = append(traceOptions, otlptracehttp.WithEndpoint(u.Host))
 		} else {
-			hostWithDefaultPort := fmt.Sprintf("%s:%d", u.Host, cDefaultCollectorHTTPPort)
+			// ref: go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/otlpconfig/DefaultCollectorHTTPPort
+			hostWithDefaultPort := fmt.Sprintf("%s:%d", u.Host, 4318)
 			traceOptions = append(traceOptions, otlptracehttp.WithEndpoint(hostWithDefaultPort))
 		}
 

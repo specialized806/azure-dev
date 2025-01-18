@@ -16,6 +16,7 @@ import (
 	"time"
 
 	azd "github.com/azure/azure-dev/cli/azd/cmd"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
 
@@ -24,19 +25,19 @@ import (
 // generate. This string is formatted with a single value, the
 // current date in MM/DD/YY format.
 const fontMatterFormatString = `---
-title: Azure Developer CLI reference (preview)
-description: This article explains the syntax and parameters for the various Azure Developer CLI Preview commands.
-author: hhunter-ms
-ms.author: hannahhunter
+title: Azure Developer CLI reference
+description: This article explains the syntax and parameters for the various Azure Developer CLI commands.
+author: alexwolfmsft
+ms.author: alexwolf
 ms.date: %v
 ms.service: azure-dev-cli
 ms.topic: conceptual
 ms.custom: devx-track-azdevcli
 ---
 
-# Azure Developer CLI reference (preview)
+# Azure Developer CLI reference
 
-This article explains the syntax and parameters for the various Azure Developer CLI Preview commands.
+This article explains the syntax and parameters for the various Azure Developer CLI commands.
 
 `
 
@@ -44,11 +45,15 @@ This article explains the syntax and parameters for the various Azure Developer 
 const directoryMode fs.FileMode = 0755
 
 func main() {
+	// Disable color output for markdown generation otherwise help strings with
+	// color configurations will contain color escape sequences in the markdown
+	// text.
+	color.NoColor = true
 	fmt.Println("Generating documentation")
 
 	// staticHelp is true to inform commands to use generate help text instead
 	// of generating help text that includes execution-specific state.
-	cmd := azd.NewRootCmd(true, nil)
+	cmd := azd.NewRootCmd(true, nil, nil)
 
 	basename := strings.Replace(cmd.CommandPath(), " ", "_", -1) + ".md"
 	filename := filepath.Join("./md", basename)
@@ -271,7 +276,7 @@ func genMarkdownCustom(cmd *cobra.Command, w io.Writer, linkHandler func(string)
 }
 
 // printOptions is the same as the un-exported helper from spf13/cobra/docs@v1.3.0
-func printOptions(buf *bytes.Buffer, cmd *cobra.Command, name string) error {
+func printOptions(buf *bytes.Buffer, cmd *cobra.Command, _ string) error {
 	flags := cmd.NonInheritedFlags()
 	flags.SetOutput(buf)
 	if flags.HasAvailableFlags() {

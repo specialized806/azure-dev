@@ -6,30 +6,36 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
 	"github.com/azure/azure-dev/cli/azd/pkg/azureutil"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 )
 
 // ResourceManager provides a layer to query for Azure resource for azd project and services
 // This would typically be used during deployment when azd need to deploy applications
 // to the Azure resource hosting the application
 type ResourceManager interface {
-	GetResourceGroupName(ctx context.Context, subscriptionId string, projectConfig *ProjectConfig) (string, error)
+	GetResourceGroupName(
+		ctx context.Context,
+		subscriptionId string,
+		resourceGroupTemplate osutil.ExpandableString,
+	) (string, error)
 	GetServiceResources(
 		ctx context.Context,
 		subscriptionId string,
 		resourceGroupName string,
 		serviceConfig *ServiceConfig,
-	) ([]azcli.AzCliResource, error)
+	) ([]*azapi.Resource, error)
 	GetServiceResource(
 		ctx context.Context,
 		subscriptionId string,
 		resourceGroupName string,
 		serviceConfig *ServiceConfig,
 		rerunCommand string,
-	) (azcli.AzCliResource, error)
+	) (*azapi.Resource, error)
 	GetTargetResource(
 		ctx context.Context,
 		subscriptionId string,
@@ -38,15 +44,24 @@ type ResourceManager interface {
 }
 
 type resourceManager struct {
-	env   *environment.Environment
-	azCli azcli.AzCli
+	env                  *environment.Environment
+	deploymentService    *azapi.StandardDeployments
+	resourceService      *azapi.ResourceService
+	azureResourceManager infra.ResourceManager
 }
 
 // NewResourceManager creates a new instance of the project resource manager
-func NewResourceManager(env *environment.Environment, azCli azcli.AzCli) ResourceManager {
+func NewResourceManager(
+	env *environment.Environment,
+	deploymentService *azapi.StandardDeployments,
+	resourceService *azapi.ResourceService,
+	azureResourceManager infra.ResourceManager,
+) ResourceManager {
 	return &resourceManager{
-		env:   env,
-		azCli: azCli,
+		env:                  env,
+		deploymentService:    deploymentService,
+		resourceService:      resourceService,
+		azureResourceManager: azureResourceManager,
 	}
 }
 
@@ -62,9 +77,9 @@ func NewResourceManager(env *environment.Environment, azCli azcli.AzCli) Resourc
 func (rm *resourceManager) GetResourceGroupName(
 	ctx context.Context,
 	subscriptionId string,
-	projectConfig *ProjectConfig,
+	resourceGroupTemplate osutil.ExpandableString,
 ) (string, error) {
-	name, err := projectConfig.ResourceGroupName.Envsubst(rm.env.Getenv)
+	name, err := resourceGroupTemplate.Envsubst(rm.env.Getenv)
 	if err != nil {
 		return "", err
 	}
@@ -73,13 +88,12 @@ func (rm *resourceManager) GetResourceGroupName(
 		return name, nil
 	}
 
-	envResourceGroupName := environment.GetResourceGroupNameFromEnvVar(rm.env)
+	envResourceGroupName := rm.env.Getenv(environment.ResourceGroupEnvVarName)
 	if envResourceGroupName != "" {
 		return envResourceGroupName, nil
 	}
 
-	resourceManager := infra.NewAzureResourceManager(rm.azCli)
-	resourceGroupName, err := resourceManager.FindResourceGroupForEnvironment(ctx, subscriptionId, rm.env.GetEnvName())
+	resourceGroupName, err := rm.azureResourceManager.FindResourceGroupForEnvironment(ctx, subscriptionId, rm.env.Name())
 	if err != nil {
 		return "", err
 	}
@@ -90,14 +104,14 @@ func (rm *resourceManager) GetResourceGroupName(
 // GetServiceResources finds azure service resources targeted by the service.
 //
 // If an explicit `ResourceName` is specified in `azure.yaml`, a resource with that name is searched for.
-// Otherwise, searches for resources with 'azd-service-name' tag set to the service key.
+// Otherwise, searches for resources with a [azure.TagKeyAzdServiceName] tag set to the service key.
 func (rm *resourceManager) GetServiceResources(
 	ctx context.Context,
 	subscriptionId string,
 	resourceGroupName string,
 	serviceConfig *ServiceConfig,
-) ([]azcli.AzCliResource, error) {
-	filter := fmt.Sprintf("tagName eq '%s' and tagValue eq '%s'", defaultServiceTag, serviceConfig.Name)
+) ([]*azapi.Resource, error) {
+	filter := fmt.Sprintf("tagName eq '%s' and tagValue eq '%s'", azure.TagKeyAzdServiceName, serviceConfig.Name)
 
 	subst, err := serviceConfig.ResourceName.Envsubst(rm.env.Getenv)
 	if err != nil {
@@ -108,11 +122,11 @@ func (rm *resourceManager) GetServiceResources(
 		filter = fmt.Sprintf("name eq '%s'", subst)
 	}
 
-	return rm.azCli.ListResourceGroupResources(
+	return rm.resourceService.ListResourceGroupResources(
 		ctx,
 		subscriptionId,
 		resourceGroupName,
-		&azcli.ListResourceGroupResourcesOptions{
+		&azapi.ListResourceGroupResourcesOptions{
 			Filter: &filter,
 		},
 	)
@@ -128,15 +142,15 @@ func (rm *resourceManager) GetServiceResource(
 	resourceGroupName string,
 	serviceConfig *ServiceConfig,
 	rerunCommand string,
-) (azcli.AzCliResource, error) {
+) (*azapi.Resource, error) {
 	expandedResourceName, err := serviceConfig.ResourceName.Envsubst(rm.env.Getenv)
 	if err != nil {
-		return azcli.AzCliResource{}, fmt.Errorf("expanding name: %w", err)
+		return nil, fmt.Errorf("expanding name: %w", err)
 	}
 
 	resources, err := rm.GetServiceResources(ctx, subscriptionId, resourceGroupName, serviceConfig)
 	if err != nil {
-		return azcli.AzCliResource{}, fmt.Errorf("getting service resource: %w", err)
+		return nil, fmt.Errorf("getting service resource: %w", err)
 	}
 
 	if expandedResourceName == "" { // A tag search was performed
@@ -144,18 +158,18 @@ func (rm *resourceManager) GetServiceResource(
 			err := fmt.Errorf(
 				//nolint:lll
 				"unable to find a resource tagged with '%s: %s'. Ensure the service resource is correctly tagged in your infrastructure configuration, and rerun %s",
-				defaultServiceTag,
+				azure.TagKeyAzdServiceName,
 				serviceConfig.Name,
 				rerunCommand,
 			)
-			return azcli.AzCliResource{}, azureutil.ResourceNotFound(err)
+			return nil, azureutil.ResourceNotFound(err)
 		}
 
 		if len(resources) != 1 {
-			return azcli.AzCliResource{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				//nolint:lll
 				"expecting only '1' resource tagged with '%s: %s', but found '%d'. Ensure a unique service resource is correctly tagged in your infrastructure configuration, and rerun %s",
-				defaultServiceTag,
+				azure.TagKeyAzdServiceName,
 				serviceConfig.Name,
 				len(resources),
 				rerunCommand,
@@ -167,12 +181,12 @@ func (rm *resourceManager) GetServiceResource(
 				"unable to find a resource with name '%s'. Ensure that resourceName in azure.yaml is valid, and rerun %s",
 				expandedResourceName,
 				rerunCommand)
-			return azcli.AzCliResource{}, azureutil.ResourceNotFound(err)
+			return nil, azureutil.ResourceNotFound(err)
 		}
 
 		// This can happen if multiple resources with different resource types are given the same name.
 		if len(resources) != 1 {
-			return azcli.AzCliResource{},
+			return nil,
 				fmt.Errorf(
 					//nolint:lll
 					"expecting only '1' resource named '%s', but found '%d'. Use a unique name for the service resource in the resource group '%s'",
@@ -190,7 +204,12 @@ func (rm *resourceManager) GetTargetResource(
 	subscriptionId string,
 	serviceConfig *ServiceConfig,
 ) (*environment.TargetResource, error) {
-	resourceGroupName, err := rm.GetResourceGroupName(ctx, subscriptionId, serviceConfig.Project)
+	resourceGroupTemplate := serviceConfig.ResourceGroupName
+	if resourceGroupTemplate.Empty() {
+		resourceGroupTemplate = serviceConfig.Project.ResourceGroupName
+	}
+
+	resourceGroupName, err := rm.GetResourceGroupName(ctx, subscriptionId, resourceGroupTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +234,7 @@ func (rm *resourceManager) resolveServiceResource(
 	resourceGroupName string,
 	serviceConfig *ServiceConfig,
 	rerunCommand string,
-) (azcli.AzCliResource, error) {
+) (*azapi.Resource, error) {
 	azureResource, err := rm.GetServiceResource(ctx, subscriptionId, resourceGroupName, serviceConfig, rerunCommand)
 
 	// If the service target supports delayed provisioning, the resource isn't expected to be found yet.
@@ -224,11 +243,11 @@ func (rm *resourceManager) resolveServiceResource(
 	if err != nil &&
 		errors.As(err, &resourceNotFoundError) &&
 		ServiceTargetKind(serviceConfig.Host).SupportsDelayedProvisioning() {
-		return azureResource, nil
+		return &azapi.Resource{}, nil
 	}
 
 	if err != nil {
-		return azcli.AzCliResource{}, err
+		return nil, err
 	}
 
 	return azureResource, nil

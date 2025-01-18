@@ -3,12 +3,16 @@ package project
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/azure/azure-dev/cli/azd/pkg/output/ux"
 )
+
+// Some endpoints include a discriminator suffix that should be displayed instead of the default 'Endpoint' label.
+var endpointPattern = regexp.MustCompile(`(.+):\s(.+)`)
 
 // ServiceLifecycleEventArgs are the event arguments available when
 // any service lifecycle event has been triggered
@@ -60,6 +64,10 @@ func (sbr *ServiceBuildResult) MarshalJSON() ([]byte, error) {
 	return json.Marshal(*sbr)
 }
 
+type PackageOptions struct {
+	OutputPath string
+}
+
 // ServicePackageResult is the result of a successful Package operation
 type ServicePackageResult struct {
 	Build       *ServiceBuildResult `json:"build"`
@@ -74,7 +82,11 @@ func (spr *ServicePackageResult) ToString(currentIndentation string) string {
 		return uxItem.ToString(currentIndentation)
 	}
 
-	return fmt.Sprintf("%s- Package Output: %s", currentIndentation, output.WithLinkFormat(spr.PackagePath))
+	if spr.PackagePath != "" {
+		return fmt.Sprintf("%s- Package Output: %s", currentIndentation, output.WithLinkFormat(spr.PackagePath))
+	}
+
+	return ""
 }
 
 func (spr *ServicePackageResult) MarshalJSON() ([]byte, error) {
@@ -100,8 +112,22 @@ func (spr *ServiceDeployResult) ToString(currentIndentation string) string {
 
 	builder := strings.Builder{}
 
-	for _, endpoint := range spr.Endpoints {
-		builder.WriteString(fmt.Sprintf("%s- Endpoint: %s\n", currentIndentation, output.WithLinkFormat(endpoint)))
+	if len(spr.Endpoints) == 0 {
+		builder.WriteString(fmt.Sprintf("%s- No endpoints were found\n", currentIndentation))
+	} else {
+		for _, endpoint := range spr.Endpoints {
+			label := "Endpoint"
+			url := endpoint
+
+			// When the endpoint pattern is matched used the first sub match as the endpoint label.
+			matches := endpointPattern.FindStringSubmatch(endpoint)
+			if len(matches) == 3 {
+				label = matches[1]
+				url = matches[2]
+			}
+
+			builder.WriteString(fmt.Sprintf("%s- %s: %s\n", currentIndentation, label, output.WithLinkFormat(url)))
+		}
 	}
 
 	return builder.String()

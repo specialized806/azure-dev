@@ -6,6 +6,7 @@ package contracts
 type ShowType string
 
 const (
+	ShowTypeNone   ShowType = ""
 	ShowTypeDotNet ShowType = "dotnet"
 	ShowTypePython ShowType = "python"
 	ShowTypeNode   ShowType = "node"
@@ -24,7 +25,8 @@ type ShowService struct {
 	Project ShowServiceProject `json:"project"`
 	// Target contains information about the resource that the service is deployed
 	// to.
-	Target *ShowTargetArm `json:"target,omitempty"`
+	Target    *ShowTargetArm `json:"target,omitempty"`
+	IngresUrl string         `json:"-"`
 }
 
 // ShowServiceProject is the contract for a service's project as returned by `azd show`

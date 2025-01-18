@@ -11,6 +11,7 @@ import (
 
 	"github.com/azure/azure-dev/cli/azd/cmd/actions"
 	"github.com/azure/azure-dev/cli/azd/internal"
+	"github.com/azure/azure-dev/cli/azd/pkg/async"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment/azdcontext"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
@@ -26,7 +27,7 @@ type restoreFlags struct {
 	all         bool
 	global      *internal.GlobalCommandOptions
 	serviceName string
-	envFlag
+	internal.EnvFlag
 }
 
 func (r *restoreFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommandOptions) {
@@ -50,7 +51,7 @@ func (r *restoreFlags) Bind(local *pflag.FlagSet, global *internal.GlobalCommand
 func newRestoreFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) *restoreFlags {
 	flags := &restoreFlags{}
 	flags.Bind(cmd.Flags(), global)
-	flags.envFlag.Bind(cmd.Flags(), global)
+	flags.EnvFlag.Bind(cmd.Flags(), global)
 	flags.global = global
 
 	return flags
@@ -59,7 +60,7 @@ func newRestoreFlags(cmd *cobra.Command, global *internal.GlobalCommandOptions) 
 func newRestoreCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore <service>",
-		Short: "Restores the application's dependencies.",
+		Short: fmt.Sprintf("Restores the application's dependencies. %s", output.WithWarningFormat("(Beta)")),
 	}
 	cmd.Args = cobra.MaximumNArgs(1)
 	return cmd
@@ -75,6 +76,7 @@ type restoreAction struct {
 	env            *environment.Environment
 	projectConfig  *project.ProjectConfig
 	projectManager project.ProjectManager
+	importManager  *project.ImportManager
 	serviceManager project.ServiceManager
 	commandRunner  exec.CommandRunner
 }
@@ -91,6 +93,7 @@ func newRestoreAction(
 	projectManager project.ProjectManager,
 	serviceManager project.ServiceManager,
 	commandRunner exec.CommandRunner,
+	importManager *project.ImportManager,
 ) actions.Action {
 	return &restoreAction{
 		flags:          flags,
@@ -104,6 +107,7 @@ func newRestoreAction(
 		serviceManager: serviceManager,
 		env:            env,
 		commandRunner:  commandRunner,
+		importManager:  importManager,
 	}
 }
 
@@ -118,6 +122,8 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 		Title: "Restoring services (azd restore)",
 	})
 
+	startTime := time.Now()
+
 	serviceNameWarningCheck(ra.console, ra.flags.serviceName, "restore")
 
 	targetServiceName := ra.flags.serviceName
@@ -128,6 +134,7 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 	targetServiceName, err := getTargetServiceName(
 		ctx,
 		ra.projectManager,
+		ra.importManager,
 		ra.projectConfig,
 		string(project.ServiceEventRestore),
 		targetServiceName,
@@ -141,15 +148,19 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 		return nil, err
 	}
 
-	if err := ra.projectManager.EnsureFrameworkTools(ctx, ra.projectConfig, func(svc *project.ServiceConfig) bool {
+	if err := ra.projectManager.EnsureRestoreTools(ctx, ra.projectConfig, func(svc *project.ServiceConfig) bool {
 		return targetServiceName == "" || svc.Name == targetServiceName
 	}); err != nil {
 		return nil, err
 	}
 
 	restoreResults := map[string]*project.ServiceRestoreResult{}
+	stableServices, err := ra.importManager.ServiceStable(ctx, ra.projectConfig)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, svc := range ra.projectConfig.GetServicesStable() {
+	for _, svc := range stableServices {
 		stepMessage := fmt.Sprintf("Restoring service %s", svc.Name)
 		ra.console.ShowSpinner(ctx, stepMessage, input.Step)
 
@@ -161,15 +172,16 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 			continue
 		}
 
-		restoreTask := ra.serviceManager.Restore(ctx, svc)
-		go func() {
-			for restoreProgress := range restoreTask.Progress() {
-				progressMessage := fmt.Sprintf("Restoring service %s (%s)", svc.Name, restoreProgress.Message)
+		restoreResult, err := async.RunWithProgress(
+			func(buildProgress project.ServiceProgress) {
+				progressMessage := fmt.Sprintf("Building service %s (%s)", svc.Name, buildProgress.Message)
 				ra.console.ShowSpinner(ctx, progressMessage, input.Step)
-			}
-		}()
+			},
+			func(progress *async.Progress[project.ServiceProgress]) (*project.ServiceRestoreResult, error) {
+				return ra.serviceManager.Restore(ctx, svc, progress)
+			},
+		)
 
-		restoreResult, err := restoreTask.Await()
 		if err != nil {
 			ra.console.StopSpinner(ctx, stepMessage, input.StepFailed)
 			return nil, err
@@ -192,18 +204,19 @@ func (ra *restoreAction) Run(ctx context.Context) (*actions.ActionResult, error)
 
 	return &actions.ActionResult{
 		Message: &actions.ResultMessage{
-			Header: "Your Azure app has been restored!",
+			Header: fmt.Sprintf(
+				"Your applications dependencies were restored in %s.", ux.DurationAsText(since(startTime))),
 		},
 	}, nil
 }
 
 func getCmdRestoreHelpDescription(*cobra.Command) string {
 	return generateCmdHelpDescription(
-		"Restore application dependencies.",
+		fmt.Sprintf("Restore application dependencies. %s", output.WithWarningFormat("(Beta)")),
 		[]string{
 			formatHelpNote("Run this command to download and install all required dependencies so that you can build," +
 				" run, and debug the application locally."),
-			formatHelpNote(fmt.Sprintf("For the best local rn and debug experience, go to %s to learn how "+
+			formatHelpNote(fmt.Sprintf("For the best local run and debug experience, go to %s to learn how "+
 				"to use the Visual Studio Code extension.",
 				output.WithLinkFormat("https://aka.ms/azure-dev/vscode"),
 			)),

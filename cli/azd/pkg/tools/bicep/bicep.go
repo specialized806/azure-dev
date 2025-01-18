@@ -15,8 +15,6 @@ import (
 	"runtime"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
-	"github.com/azure/azure-dev/cli/azd/internal/telemetry/events"
 	"github.com/azure/azure-dev/cli/azd/pkg/config"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
@@ -25,37 +23,33 @@ import (
 	"github.com/blang/semver/v4"
 )
 
-// cBicepVersion is the minimum version of bicep that we require (and the one we fetch when we fetch bicep on behalf of a
+// Version is the minimum version of bicep that we require (and the one we fetch when we fetch bicep on behalf of a
 // user).
-var cBicepVersion semver.Version = semver.MustParse("0.16.1")
+var Version semver.Version = semver.MustParse("0.32.4")
 
-type BicepCli interface {
-	Build(ctx context.Context, file string) (string, error)
-}
-
-// NewBicepCli creates a new BicepCli. Azd manages its own copy of the bicep CLI, stored in `$AZD_CONFIG_DIR/bin`. If
+// NewCli creates a new Bicep CLI. Azd manages its own copy of the bicep CLI, stored in `$AZD_CONFIG_DIR/bin`. If
 // bicep is not present at this location, or if it is present but is older than the minimum supported version, it is
 // downloaded.
-func NewBicepCli(
+func NewCli(
 	ctx context.Context,
 	console input.Console,
 	commandRunner exec.CommandRunner,
-) (BicepCli, error) {
-	return newBicepCliWithTransporter(ctx, console, commandRunner, http.DefaultClient)
+) (*Cli, error) {
+	return newCliWithTransporter(ctx, console, commandRunner, http.DefaultClient)
 }
 
-// newBicepCliWithTransporter is like NewBicepCli but allows providing a custom transport to use when downloading the
-// bicep CLI, for testing purposes.
-func newBicepCliWithTransporter(
+// newCliWithTransporter is like NewBicepCli but allows providing a custom transport to use when downloading the
+// Bicep CLI, for testing purposes.
+func newCliWithTransporter(
 	ctx context.Context,
 	console input.Console,
 	commandRunner exec.CommandRunner,
 	transporter policy.Transporter,
-) (BicepCli, error) {
+) (*Cli, error) {
 	if override := os.Getenv("AZD_BICEP_TOOL_PATH"); override != "" {
 		log.Printf("using external bicep tool: %s", override)
 
-		return &bicepCli{
+		return &Cli{
 			path:   override,
 			runner: commandRunner,
 		}, nil
@@ -76,14 +70,14 @@ func newBicepCliWithTransporter(
 
 		if err := runStep(
 			ctx, console, "Downloading Bicep", func() error {
-				return downloadBicep(ctx, transporter, cBicepVersion, bicepPath)
+				return downloadBicep(ctx, transporter, Version, bicepPath)
 			},
 		); err != nil {
 			return nil, fmt.Errorf("downloading bicep: %w", err)
 		}
 	}
 
-	cli := &bicepCli{
+	cli := &Cli{
 		path:   bicepPath,
 		runner: commandRunner,
 	}
@@ -93,12 +87,14 @@ func newBicepCliWithTransporter(
 		return nil, fmt.Errorf("checking bicep version: %w", err)
 	}
 
-	if ver.LT(cBicepVersion) {
-		log.Printf("installed bicep version %s is older than %s; updating.", ver.String(), cBicepVersion.String())
+	log.Printf("bicep version: %s", ver)
+
+	if ver.LT(Version) {
+		log.Printf("installed bicep version %s is older than %s; updating.", ver.String(), Version.String())
 
 		if err := runStep(
 			ctx, console, "Upgrading Bicep", func() error {
-				return downloadBicep(ctx, transporter, cBicepVersion, bicepPath)
+				return downloadBicep(ctx, transporter, Version, bicepPath)
 			},
 		); err != nil {
 			return nil, fmt.Errorf("upgrading bicep: %w", err)
@@ -124,7 +120,7 @@ func runStep(ctx context.Context, console input.Console, title string, action fu
 	return nil
 }
 
-type bicepCli struct {
+type Cli struct {
 	path   string
 	runner exec.CommandRunner
 }
@@ -162,11 +158,11 @@ func downloadBicep(ctx context.Context, transporter policy.Transporter, bicepVer
 	case "darwin":
 		releaseName = fmt.Sprintf("bicep-osx-%s", arch)
 	case "linux":
-		if _, err := os.Stat("/lib/ld-musl-x86_64.so.1"); err == nil {
-			// As of 0.14.46, there is no version of for AM64 on musl based systems.
-			if arch == "arm64" {
+		if preferMuslBicep(os.Stat) {
+			if runtime.GOARCH != "arm64" {
 				return fmt.Errorf("unsupported architecture: %s", runtime.GOARCH)
 			}
+
 			releaseName = "bicep-linux-musl-x64"
 		} else {
 			releaseName = fmt.Sprintf("bicep-linux-%s", arch)
@@ -179,11 +175,7 @@ func downloadBicep(ctx context.Context, transporter policy.Transporter, bicepVer
 
 	log.Printf("downloading bicep release %s -> %s", bicepReleaseUrl, name)
 
-	var err error
-	spanCtx, span := telemetry.GetTracer().Start(ctx, events.BicepInstallEvent)
-	defer span.EndWithStatus(err)
-
-	req, err := http.NewRequestWithContext(spanCtx, "GET", bicepReleaseUrl, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", bicepReleaseUrl, nil)
 	if err != nil {
 		return err
 	}
@@ -225,8 +217,25 @@ func downloadBicep(ctx context.Context, transporter policy.Transporter, bicepVer
 	return nil
 }
 
-func (cli *bicepCli) version(ctx context.Context) (semver.Version, error) {
-	bicepRes, err := cli.runCommand(ctx, "--version")
+type stater func(name string) (os.FileInfo, error)
+
+// preferMuslBicep determines if we should install the version of bicep that used musl instead of glibc. We prefer
+// musl bicep on linux systems that have musl installed and do not have glibc installed. If both musl and glibc are
+// installed, we prefer the glibc based version.  This behavior matches the `az` CLI (see: Azure/azure-cli#23040)
+func preferMuslBicep(stat stater) bool {
+	if _, err := stat("/lib/ld-musl-x86_64.so.1"); err == nil {
+		if _, err := stat("/lib/x86_64-linux-gnu/libc.so.6"); err == nil {
+			return false
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func (cli *Cli) version(ctx context.Context) (semver.Version, error) {
+	bicepRes, err := cli.runCommand(ctx, nil, "--version")
 	if err != nil {
 		return semver.Version{}, err
 	}
@@ -240,22 +249,52 @@ func (cli *bicepCli) version(ctx context.Context) (semver.Version, error) {
 
 }
 
-func (cli *bicepCli) Build(ctx context.Context, file string) (string, error) {
+type BuildResult struct {
+	// The compiled ARM template
+	Compiled string
+
+	// Lint error message, if any
+	LintErr string
+}
+
+func (cli *Cli) Build(ctx context.Context, file string) (BuildResult, error) {
 	args := []string{"build", file, "--stdout"}
-	buildRes, err := cli.runCommand(ctx, args...)
+	buildRes, err := cli.runCommand(ctx, nil, args...)
 
 	if err != nil {
-		return "", fmt.Errorf(
-			"failed running bicep build: %s (%w)",
-			buildRes.String(),
+		return BuildResult{}, fmt.Errorf(
+			"failed running bicep build: %w",
 			err,
 		)
 	}
 
-	return buildRes.Stdout, nil
+	return BuildResult{
+		Compiled: buildRes.Stdout,
+		LintErr:  buildRes.Stderr,
+	}, nil
 }
 
-func (cli *bicepCli) runCommand(ctx context.Context, args ...string) (exec.RunResult, error) {
+func (cli *Cli) BuildBicepParam(ctx context.Context, file string, env []string) (BuildResult, error) {
+	args := []string{"build-params", file, "--stdout"}
+	buildRes, err := cli.runCommand(ctx, env, args...)
+
+	if err != nil {
+		return BuildResult{}, fmt.Errorf(
+			"failed running bicep build: %w",
+			err,
+		)
+	}
+
+	return BuildResult{
+		Compiled: buildRes.Stdout,
+		LintErr:  buildRes.Stderr,
+	}, nil
+}
+
+func (cli *Cli) runCommand(ctx context.Context, env []string, args ...string) (exec.RunResult, error) {
 	runArgs := exec.NewRunArgs(cli.path, args...)
+	if env != nil {
+		runArgs = runArgs.WithEnv(env)
+	}
 	return cli.runner.Run(ctx, runArgs)
 }

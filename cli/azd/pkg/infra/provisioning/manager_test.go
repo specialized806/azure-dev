@@ -8,49 +8,241 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm/policy"
 	"github.com/azure/azure-dev/cli/azd/pkg/account"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/cloud"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
-	"github.com/azure/azure-dev/cli/azd/pkg/infra"
-	. "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
-	_ "github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning/test"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning"
+	"github.com/azure/azure-dev/cli/azd/pkg/infra/provisioning/test"
 	"github.com/azure/azure-dev/cli/azd/pkg/input"
-	"github.com/azure/azure-dev/cli/azd/pkg/tools/azcli"
+	"github.com/azure/azure-dev/cli/azd/pkg/prompt"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockaccount"
-	"github.com/azure/azure-dev/cli/azd/test/mocks/mockazcli"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockazapi"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockenv"
+	"github.com/benbjohnson/clock"
 	"github.com/stretchr/testify/require"
 )
 
 func TestProvisionInitializesEnvironment(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", nil)
-	options := Options{Provider: "test"}
-	interactive := false
+	env := environment.NewWithValues("test-env", nil)
 
 	mockContext := mocks.NewMockContext(context.Background())
 	mockContext.Console.WhenSelect(func(options input.ConsoleOptions) bool {
-		return strings.Contains(options.Message, "Please select an Azure Subscription to use")
+		return strings.Contains(options.Message, "Select an Azure Subscription to use")
 	}).RespondFn(func(options input.ConsoleOptions) (any, error) {
 		// Select the first from the list
 		return 0, nil
 	})
 	mockContext.Console.WhenSelect(func(options input.ConsoleOptions) bool {
-		return strings.Contains(options.Message, "Please select an Azure location")
+		return strings.Contains(options.Message, "Select an Azure location")
 	}).RespondFn(func(options input.ConsoleOptions) (any, error) {
 		// Select the first from the list
 		return 0, nil
 	})
 
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-	mgr, err := NewManager(
-		*mockContext.Context,
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
 		env,
-		"",
-		options,
-		interactive,
-		azCli,
 		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	require.Equal(t, "00000000-0000-0000-0000-000000000000", env.GetSubscriptionId())
+	require.Equal(t, "location", env.GetLocation())
+}
+
+func TestManagerPreview(t *testing.T) {
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
+		"AZURE_LOCATION":        "eastus2",
+	})
+
+	mockContext := mocks.NewMockContext(context.Background())
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
+		env,
+		mockContext.Console,
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	deploymentPlan, err := mgr.Preview(*mockContext.Context)
+
+	require.NotNil(t, deploymentPlan)
+	require.Nil(t, err)
+}
+
+func TestManagerGetState(t *testing.T) {
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
+		"AZURE_LOCATION":        "eastus2",
+	})
+
+	mockContext := mocks.NewMockContext(context.Background())
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
+		env,
+		mockContext.Console,
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	getResult, err := mgr.State(*mockContext.Context, nil)
+
+	require.NotNil(t, getResult)
+	require.Nil(t, err)
+}
+
+func TestManagerDeploy(t *testing.T) {
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
+		"AZURE_LOCATION":        "eastus2",
+	})
+
+	mockContext := mocks.NewMockContext(context.Background())
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
+		env,
+		mockContext.Console,
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	deployResult, err := mgr.Deploy(*mockContext.Context)
+
+	require.NotNil(t, deployResult)
+	require.Nil(t, err)
+}
+
+func TestManagerDestroyWithPositiveConfirmation(t *testing.T) {
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
+		"AZURE_LOCATION":        "eastus2",
+	})
+
+	mockContext := mocks.NewMockContext(context.Background())
+	mockContext.Console.WhenConfirm(func(options input.ConsoleOptions) bool {
+		return strings.Contains(options.Message, "Are you sure you want to destroy?")
+	}).Respond(true)
+
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	envManager.On("Save", *mockContext.Context, env).Return(nil)
+
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
+		env,
+		mockContext.Console,
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := mgr.Destroy(*mockContext.Context, destroyOptions)
+
+	require.NotNil(t, destroyResult)
+	require.Nil(t, err)
+	require.Contains(t, mockContext.Console.Output(), "Are you sure you want to destroy?")
+}
+
+func TestManagerDestroyWithNegativeConfirmation(t *testing.T) {
+	env := environment.NewWithValues("test-env", map[string]string{
+		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
+		"AZURE_LOCATION":        "eastus2",
+	})
+
+	mockContext := mocks.NewMockContext(context.Background())
+
+	mockContext.Console.WhenConfirm(func(options input.ConsoleOptions) bool {
+		return strings.Contains(options.Message, "Are you sure you want to destroy?")
+	}).Respond(false)
+
+	registerContainerDependencies(mockContext, env)
+
+	envManager := &mockenv.MockEnvManager{}
+	mgr := provisioning.NewManager(
+		mockContext.Container,
+		defaultProvider,
+		envManager,
+		env,
+		mockContext.Console,
+		mockContext.AlphaFeaturesManager,
+		nil,
+		cloud.AzurePublic(),
+	)
+	err := mgr.Initialize(*mockContext.Context, "", provisioning.Options{Provider: "test"})
+	require.NoError(t, err)
+
+	destroyOptions := provisioning.NewDestroyOptions(false, false)
+	destroyResult, err := mgr.Destroy(*mockContext.Context, destroyOptions)
+
+	require.Nil(t, destroyResult)
+	require.NotNil(t, err)
+	require.Contains(t, mockContext.Console.Output(), "Are you sure you want to destroy?")
+}
+
+func registerContainerDependencies(mockContext *mocks.MockContext, env *environment.Environment) {
+	envManager := &mockenv.MockEnvManager{}
+	envManager.On("Save", *mockContext.Context, env).Return(nil)
+
+	mockContext.Container.MustRegisterSingleton(func() environment.Manager {
+		return envManager
+	})
+
+	mockContext.Container.MustRegisterSingleton(func() account.SubscriptionCredentialProvider {
+		return mockContext.SubscriptionCredentialProvider
+	})
+	mockContext.Container.MustRegisterSingleton(func() *policy.ClientOptions {
+		return mockContext.ArmClientOptions
+	})
+
+	mockContext.Container.MustRegisterSingleton(azapi.NewResourceService)
+	mockContext.Container.MustRegisterSingleton(prompt.NewDefaultPrompter)
+	mockContext.Container.MustRegisterSingleton(azapi.NewResourceService)
+	mockContext.Container.MustRegisterNamedTransient(string(provisioning.Test), test.NewTestProvider)
+	mockContext.Container.MustRegisterSingleton(func() account.Manager {
+		return &mockaccount.MockAccountManager{
 			Subscriptions: []account.Subscription{
 				{
 					Id:   "00000000-0000-0000-0000-000000000000",
@@ -64,227 +256,24 @@ func TestProvisionInitializesEnvironment(t *testing.T) {
 					RegionalDisplayName: "(US) Test Location",
 				},
 			},
-		},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	_, err = mgr.Plan(*mockContext.Context)
-	require.NoError(t, err)
-
-	require.Equal(t, "00000000-0000-0000-0000-000000000000", env.GetSubscriptionId())
-	require.Equal(t, "location", env.GetLocation())
-}
-
-func TestManagerPlan(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
-		"AZURE_LOCATION":        "eastus2",
+		}
 	})
-	options := Options{Provider: "test"}
-	interactive := false
-
-	mockContext := mocks.NewMockContext(context.Background())
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-	mgr, err := NewManager(
-		*mockContext.Context,
-		env,
-		"",
-		options,
-		interactive,
-		azCli,
-		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	deploymentPlan, err := mgr.Plan(*mockContext.Context)
-
-	require.NotNil(t, deploymentPlan)
-	require.Nil(t, err)
-	require.Equal(t, deploymentPlan.Deployment.Parameters["location"].Value, env.Values["AZURE_LOCATION"])
-}
-
-func TestManagerGetState(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
-		"AZURE_LOCATION":        "eastus2",
+	mockContext.Container.MustRegisterSingleton(func() *environment.Environment {
+		return env
 	})
-	options := Options{Provider: "test"}
-	interactive := false
-
-	mockContext := mocks.NewMockContext(context.Background())
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-	mgr, err := NewManager(
-		*mockContext.Context,
-		env,
-		"",
-		options,
-		interactive,
-		azCli,
-		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	provisioningScope := infra.NewSubscriptionScope(
-		azCli,
-		"eastus2",
-		env.GetSubscriptionId(),
-		env.GetEnvName(),
-	)
-	getResult, err := mgr.State(*mockContext.Context, provisioningScope)
-
-	require.NotNil(t, getResult)
-	require.Nil(t, err)
-}
-
-func TestManagerDeploy(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
-		"AZURE_LOCATION":        "eastus2",
+	mockContext.Container.MustRegisterSingleton(func() *azapi.AzureClient {
+		return mockazapi.NewAzureClientFromMockContext(mockContext)
 	})
-	options := Options{Provider: "test"}
-	interactive := false
 
-	mockContext := mocks.NewMockContext(context.Background())
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-	mgr, err := NewManager(
-		*mockContext.Context,
-		env,
-		"",
-		options,
-		interactive,
-		azCli,
-		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	deploymentPlan, _ := mgr.Plan(*mockContext.Context)
-	provisioningScope := infra.NewSubscriptionScope(
-		azCli,
-		"eastus2",
-		env.GetSubscriptionId(),
-		env.GetEnvName(),
-	)
-	deployResult, err := mgr.Deploy(*mockContext.Context, deploymentPlan, provisioningScope)
-
-	require.NotNil(t, deployResult)
-	require.Nil(t, err)
-}
-
-func TestManagerDestroyWithPositiveConfirmation(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
-		"AZURE_LOCATION":        "eastus2",
+	mockContext.Container.MustRegisterSingleton(func() clock.Clock {
+		return clock.NewMock()
 	})
-	options := Options{Provider: "test"}
-	interactive := false
 
-	mockContext := mocks.NewMockContext(context.Background())
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-
-	mockContext.Console.WhenConfirm(func(options input.ConsoleOptions) bool {
-		return strings.Contains(options.Message, "Are you sure you want to destroy?")
-	}).Respond(true)
-
-	mgr, err := NewManager(
-		*mockContext.Context, env, "", options, interactive, azCli,
-		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	deploymentPlan, _ := mgr.Plan(*mockContext.Context)
-	destroyOptions := NewDestroyOptions(false, false)
-	destroyResult, err := mgr.Destroy(*mockContext.Context, &deploymentPlan.Deployment, destroyOptions)
-
-	require.NotNil(t, destroyResult)
-	require.Nil(t, err)
-	require.Contains(t, mockContext.Console.Output(), "Are you sure you want to destroy?")
-}
-
-func TestManagerDestroyWithNegativeConfirmation(t *testing.T) {
-	env := environment.EphemeralWithValues("test-env", map[string]string{
-		"AZURE_SUBSCRIPTION_ID": "SUBSCRIPTION_ID",
-		"AZURE_LOCATION":        "eastus2",
+	mockContext.Container.MustRegisterSingleton(func() *cloud.Cloud {
+		return cloud.AzurePublic()
 	})
-	options := Options{Provider: "test"}
-	interactive := false
-
-	mockContext := mocks.NewMockContext(context.Background())
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-
-	mockContext.Console.WhenConfirm(func(options input.ConsoleOptions) bool {
-		return strings.Contains(options.Message, "Are you sure you want to destroy?")
-	}).Respond(false)
-
-	mgr, err := NewManager(
-		*mockContext.Context,
-		env,
-		"",
-		options,
-		interactive,
-		azCli,
-		mockContext.Console,
-		mockContext.CommandRunner,
-		&mockaccount.MockAccountManager{},
-		azcli.NewUserProfileService(
-			&mocks.MockMultiTenantCredentialProvider{},
-			mockContext.HttpClient,
-		),
-		&mockSubscriptionTenantResolver{},
-		mockContext.AlphaFeaturesManager,
-	)
-	require.NoError(t, err)
-
-	deploymentPlan, _ := mgr.Plan(*mockContext.Context)
-	destroyOptions := NewDestroyOptions(false, false)
-	destroyResult, err := mgr.Destroy(*mockContext.Context, &deploymentPlan.Deployment, destroyOptions)
-
-	require.Nil(t, destroyResult)
-	require.NotNil(t, err)
-	require.Contains(t, mockContext.Console.Output(), "Are you sure you want to destroy?")
 }
 
-type mockSubscriptionTenantResolver struct {
-}
-
-func (m *mockSubscriptionTenantResolver) LookupTenant(
-	ctx context.Context, subscriptionId string) (tenantId string, err error) {
-	return "00000000-0000-0000-0000-000000000000", nil
+func defaultProvider() (provisioning.ProviderKind, error) {
+	return provisioning.Bicep, nil
 }

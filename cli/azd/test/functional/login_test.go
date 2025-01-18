@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -40,12 +41,7 @@ func Test_CLI_AuthLoginStatus(t *testing.T) {
 	defer cancel()
 
 	cli := azdcli.NewCLI(t)
-	result, err := cli.RunCommand(ctx, "auth", "login", "--check-status", "--output", "json")
-	require.NoError(t, err)
-
-	loginResult := contracts.LoginResult{}
-	err = json.Unmarshal([]byte(result.Stdout), &loginResult)
-	require.NoError(t, err, "failed to deserialize login result")
+	loginResult := loginStatus(t, ctx, cli)
 
 	switch loginResult.Status {
 	case contracts.LoginStatusUnauthenticated:
@@ -55,4 +51,15 @@ func Test_CLI_AuthLoginStatus(t *testing.T) {
 	default:
 		require.Fail(t, "Unexpected login status: %s", loginResult.Status)
 	}
+}
+
+func loginStatus(t *testing.T, ctx context.Context, cli *azdcli.CLI) contracts.LoginResult {
+	result, err := cli.RunCommand(ctx, "auth", "login", "--check-status", "--output", "json")
+	require.NoError(t, err)
+
+	loginResult := contracts.LoginResult{}
+	err = json.Unmarshal([]byte(result.Stdout), &loginResult)
+	require.NoError(t, err, "failed to deserialize login result")
+
+	return loginResult
 }

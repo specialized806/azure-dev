@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-//go:generate goversioninfo
+//go:generate goversioninfo -arm -64
 
 package main
 
@@ -26,6 +26,10 @@ import (
 	"github.com/azure/azure-dev/cli/azd/cmd"
 	"github.com/azure/azure-dev/cli/azd/internal"
 	"github.com/azure/azure-dev/cli/azd/internal/telemetry"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
+	"github.com/azure/azure-dev/cli/azd/pkg/installer"
+	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/oneauth"
 	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/pkg/output"
 	"github.com/blang/semver/v4"
@@ -49,12 +53,25 @@ func main() {
 		log.SetOutput(io.Discard)
 	}
 
+	log.Printf("azd version: %s", internal.Version)
+
 	ts := telemetry.GetTelemetrySystem()
 
 	latest := make(chan semver.Version)
 	go fetchLatestVersion(latest)
 
-	cmdErr := cmd.NewRootCmd(false, nil).ExecuteContext(ctx)
+	rootContainer := ioc.NewNestedContainer(nil)
+	ioc.RegisterInstance(rootContainer, ctx)
+	cmdErr := cmd.NewRootCmd(false, nil, rootContainer).ExecuteContext(ctx)
+
+	oneauth.Shutdown()
+
+	if !isJsonOutput() {
+		if firstNotice := telemetry.FirstNotice(); firstNotice != "" {
+			fmt.Fprintln(os.Stderr, output.WithWarningFormat(firstNotice))
+		}
+	}
+
 	latestVersion, ok := <-latest
 
 	// If we were able to fetch a latest version, check to see if we are up to date and
@@ -70,28 +87,59 @@ func main() {
 			// case
 			log.Printf("eliding update message for dev build")
 		} else if latestVersion.GT(internal.VersionInfo().Version) {
-			var upgradeUrl string
+			var upgradeText string
+
+			installedBy := installer.InstalledBy()
 			if runtime.GOOS == "windows" {
-				upgradeUrl = "https://aka.ms/azd/upgrade/windows"
+				switch installedBy {
+				case installer.InstallTypePs:
+					//nolint:lll
+					upgradeText = "run:\npowershell -ex AllSigned -c \"Invoke-RestMethod 'https://aka.ms/install-azd.ps1' | Invoke-Expression\"\n\nIf the install script was run with custom parameters, ensure that the same parameters are used for the upgrade. For advanced install instructions, see: https://aka.ms/azd/upgrade/windows"
+				case installer.InstallTypeWinget:
+					upgradeText = "run:\nwinget upgrade Microsoft.Azd"
+				case installer.InstallTypeChoco:
+					upgradeText = "run:\nchoco upgrade azd"
+				default:
+					// Also covers "msi" case where the user installed directly
+					// via MSI
+					upgradeText = "visit https://aka.ms/azd/upgrade/windows"
+				}
 			} else if runtime.GOOS == "linux" {
-				upgradeUrl = "https://aka.ms/azd/upgrade/linux"
+				switch installedBy {
+				case installer.InstallTypeSh:
+					//nolint:lll
+					upgradeText = "run:\ncurl -fsSL https://aka.ms/install-azd.sh | bash\n\nIf the install script was run with custom parameters, ensure that the same parameters are used for the upgrade. For advanced install instructions, see: https://aka.ms/azd/upgrade/linux"
+				default:
+					// Also covers "deb" and "rpm" cases which are currently
+					// documented. When package manager distribution support is
+					// added, this will need to be updated.
+					upgradeText = "visit https://aka.ms/azd/upgrade/linux"
+				}
 			} else if runtime.GOOS == "darwin" {
-				upgradeUrl = "https://aka.ms/azd/upgrade/mac"
+				switch installedBy {
+				case installer.InstallTypeBrew:
+					upgradeText = "run:\nbrew update && brew upgrade azd"
+				case installer.InstallTypeSh:
+					//nolint:lll
+					upgradeText = "run:\ncurl -fsSL https://aka.ms/install-azd.sh | bash\n\nIf the install script was run with custom parameters, ensure that the same parameters are used for the upgrade. For advanced install instructions, see: https://aka.ms/azd/upgrade/mac"
+				default:
+					upgradeText = "visit https://aka.ms/azd/upgrade/mac"
+				}
 			} else {
 				// Platform is not recognized, use the generic install link
-				upgradeUrl = "https://aka.ms/azd/upgrade"
+				upgradeText = "visit https://aka.ms/azd/upgrade"
 			}
 
 			fmt.Fprintln(
 				os.Stderr,
 				output.WithWarningFormat(
-					"warning: your version of azd is out of date, you have %s and the latest version is %s",
+					"WARNING: your version of azd is out of date, you have %s and the latest version is %s",
 					internal.VersionInfo().Version.String(), latestVersion.String()))
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(
 				os.Stderr,
-				output.WithWarningFormat(`To update to the latest version, follow instructions at: %s`,
-					upgradeUrl))
+				output.WithWarningFormat(`To update to the latest version, %s`,
+					upgradeText))
 		}
 	}
 
@@ -113,9 +161,6 @@ func main() {
 		os.Exit(1)
 	}
 }
-
-// azdConfigDir is the name of the folder where `azd` writes user wide configuration data.
-const azdConfigDir = ".azd"
 
 // updateCheckCacheFileName is the name of the file created in the azd configuration directory
 // which is used to cache version information for our up to date check.
@@ -141,13 +186,13 @@ func fetchLatestVersion(version chan<- semver.Version) {
 
 	// To avoid fetching the latest version of the CLI on every invocation, we cache the result for a period
 	// of time, in the user's home directory.
-	homeDir, err := os.UserHomeDir()
+	configDir, err := config.GetUserConfigDir()
 	if err != nil {
-		log.Printf("could not determine current home directory: %v, skipping update check", err)
+		log.Printf("could not determine config directory: %v, skipping update check", err)
 		return
 	}
 
-	cacheFilePath := filepath.Join(homeDir, azdConfigDir, updateCheckCacheFileName)
+	cacheFilePath := filepath.Join(configDir, updateCheckCacheFileName)
 	cacheFile, err := os.ReadFile(cacheFilePath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Printf("error reading update cache file: %v, skipping update check", err)
@@ -197,7 +242,7 @@ func fetchLatestVersion(version chan<- semver.Version) {
 			log.Printf("failed to create request object: %v, skipping update check", err)
 		}
 
-		req.Header.Set("User-Agent", internal.MakeUserAgentString(""))
+		req.Header.Set("User-Agent", internal.UserAgent())
 
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -323,6 +368,16 @@ func startBackgroundUploadProcess() error {
 	}
 
 	cmd := exec.Command(execPath, cmd.TelemetryCommandFlag, cmd.TelemetryUploadCommandFlag)
+
+	// Use the location of azd as the cwd for the background uploading process.  On windows, when a process is running
+	// the current working directory is considered in use and can not be deleted. If a user runs `azd` in a directory, we
+	// do want that directory to be considered in use and locked while the telemetry upload is happening. One example of
+	// where we see this problem often is in our CI for end to end tests where we run a copy of `azd` that we built in an
+	// ephemeral directory created by (*testing.T).TempDir().  When the test completes, the testing package attempts to
+	// clean up the temporary directory, but if the telemetry upload process is still running, the directory can not be
+	// deleted.
+	cmd.Dir = filepath.Dir(execPath)
+
 	err = cmd.Start()
 	return err
 }

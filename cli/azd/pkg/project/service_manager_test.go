@@ -6,18 +6,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
+	"github.com/azure/azure-dev/cli/azd/pkg/alpha"
 	"github.com/azure/azure-dev/cli/azd/pkg/async"
-	"github.com/azure/azure-dev/cli/azd/pkg/convert"
+	"github.com/azure/azure-dev/cli/azd/pkg/azapi"
+	"github.com/azure/azure-dev/cli/azd/pkg/azure"
+	"github.com/azure/azure-dev/cli/azd/pkg/config"
 	"github.com/azure/azure-dev/cli/azd/pkg/environment"
 	"github.com/azure/azure-dev/cli/azd/pkg/exec"
 	"github.com/azure/azure-dev/cli/azd/pkg/ext"
 	"github.com/azure/azure-dev/cli/azd/pkg/infra"
-	"github.com/azure/azure-dev/cli/azd/pkg/ioc"
+	"github.com/azure/azure-dev/cli/azd/pkg/osutil"
 	"github.com/azure/azure-dev/cli/azd/pkg/tools"
 	"github.com/azure/azure-dev/cli/azd/test/mocks"
 	"github.com/azure/azure-dev/cli/azd/test/mocks/mockarmresources"
-	"github.com/azure/azure-dev/cli/azd/test/mocks/mockazcli"
+	"github.com/azure/azure-dev/cli/azd/test/mocks/mockazapi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,21 +38,32 @@ const (
 	serviceTargetDeployCalled  contextKey = "serviceTargetDeployCalled"
 )
 
-func createServiceManager(mockContext *mocks.MockContext, env *environment.Environment) ServiceManager {
-	azCli := mockazcli.NewAzCliFromMockContext(mockContext)
-	resourceManager := NewResourceManager(env, azCli)
-	serviceLocator := ioc.NewServiceLocator(mockContext.Container)
+func createServiceManager(
+	mockContext *mocks.MockContext,
+	env *environment.Environment,
+	operationCache ServiceOperationCache,
+) ServiceManager {
+	deploymentService := mockazapi.NewStandardDeploymentsFromMockContext(mockContext)
+	resourceService := azapi.NewResourceService(mockContext.SubscriptionCredentialProvider, mockContext.ArmClientOptions)
+	azureResourceManager := infra.NewAzureResourceManager(resourceService, deploymentService)
+	resourceManager := NewResourceManager(env, deploymentService, resourceService, azureResourceManager)
 
-	return NewServiceManager(env, resourceManager, serviceLocator)
+	alphaManager := alpha.NewFeaturesManagerWithConfig(config.NewConfig(
+		map[string]any{
+			"alpha": map[string]any{
+				"all": "on",
+			},
+		}))
+
+	return NewServiceManager(env, resourceManager, mockContext.Container, operationCache, alphaManager)
 }
 
 func Test_ServiceManager_GetRequiredTools(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
-
 	tools, err := sm.GetRequiredTools(*mockContext.Context, serviceConfig)
 	require.NoError(t, err)
 	// Both require a tool, but only 1 unique tool
@@ -58,8 +73,8 @@ func Test_ServiceManager_GetRequiredTools(t *testing.T) {
 func Test_ServiceManager_Initialize(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	err := sm.Initialize(*mockContext.Context, serviceConfig)
@@ -69,8 +84,8 @@ func Test_ServiceManager_Initialize(t *testing.T) {
 func Test_ServiceManager_Restore(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	raisedPreRestoreEvent := false
@@ -86,13 +101,12 @@ func Test_ServiceManager_Restore(t *testing.T) {
 		return nil
 	})
 
-	restoreCalled := convert.RefOf(false)
+	restoreCalled := to.Ptr(false)
 	ctx := context.WithValue(*mockContext.Context, frameworkRestoreCalled, restoreCalled)
+	result, err := logProgress(t, func(progess *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+		return sm.Restore(ctx, serviceConfig, progess)
+	})
 
-	restoreTask := sm.Restore(ctx, serviceConfig)
-	logProgress(restoreTask)
-
-	result, err := restoreTask.Await()
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, *restoreCalled)
@@ -103,8 +117,8 @@ func Test_ServiceManager_Restore(t *testing.T) {
 func Test_ServiceManager_Build(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	raisedPreBuildEvent := false
@@ -120,13 +134,13 @@ func Test_ServiceManager_Build(t *testing.T) {
 		return nil
 	})
 
-	buildCalled := convert.RefOf(false)
+	buildCalled := to.Ptr(false)
 	ctx := context.WithValue(*mockContext.Context, frameworkBuildCalled, buildCalled)
 
-	buildTask := sm.Build(ctx, serviceConfig, nil)
-	logProgress(buildTask)
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+		return sm.Build(ctx, serviceConfig, nil, progress)
+	})
 
-	result, err := buildTask.Await()
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, *buildCalled)
@@ -137,8 +151,8 @@ func Test_ServiceManager_Build(t *testing.T) {
 func Test_ServiceManager_Package(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	raisedPrePackageEvent := false
@@ -154,15 +168,15 @@ func Test_ServiceManager_Package(t *testing.T) {
 		return nil
 	})
 
-	fakeFrameworkPackageCalled := convert.RefOf(false)
-	fakeServiceTargetPackageCalled := convert.RefOf(false)
+	fakeFrameworkPackageCalled := to.Ptr(false)
+	fakeServiceTargetPackageCalled := to.Ptr(false)
 	ctx := context.WithValue(*mockContext.Context, frameworkPackageCalled, fakeFrameworkPackageCalled)
 	ctx = context.WithValue(ctx, serviceTargetPackageCalled, fakeServiceTargetPackageCalled)
 
-	packageTask := sm.Package(ctx, serviceConfig, nil)
-	logProgress(packageTask)
+	result, err := logProgress(t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+		return sm.Package(ctx, serviceConfig, nil, progress, nil)
+	})
 
-	result, err := packageTask.Await()
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, *fakeFrameworkPackageCalled)
@@ -174,10 +188,10 @@ func Test_ServiceManager_Package(t *testing.T) {
 func Test_ServiceManager_Deploy(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.EphemeralWithValues("test", map[string]string{
+	env := environment.NewWithValues("test", map[string]string{
 		environment.SubscriptionIdEnvVarName: "SUBSCRIPTION_ID",
 	})
-	sm := createServiceManager(mockContext, env)
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	raisedPreDeployEvent := false
@@ -193,13 +207,13 @@ func Test_ServiceManager_Deploy(t *testing.T) {
 		return nil
 	})
 
-	deployCalled := convert.RefOf(false)
+	deployCalled := to.Ptr(false)
 	ctx := context.WithValue(*mockContext.Context, serviceTargetDeployCalled, deployCalled)
 
-	deployTask := sm.Deploy(ctx, serviceConfig, nil)
-	logProgress(deployTask)
+	result, err := logProgress(t, func(progess *async.Progress[ServiceProgress]) (*ServiceDeployResult, error) {
+		return sm.Deploy(ctx, serviceConfig, nil, progess)
+	})
 
-	result, err := deployTask.Await()
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.True(t, *deployCalled)
@@ -208,23 +222,54 @@ func Test_ServiceManager_Deploy(t *testing.T) {
 }
 
 func Test_ServiceManager_GetFrameworkService(t *testing.T) {
-	mockContext := mocks.NewMockContext(context.Background())
-	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
-	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
+	t.Run("Standard", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(context.Background())
+		setupMocksForServiceManager(mockContext)
+		env := environment.New("test")
+		sm := createServiceManager(mockContext, env, ServiceOperationCache{})
+		serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
-	framework, err := sm.GetFrameworkService(*mockContext.Context, serviceConfig)
-	require.NoError(t, err)
-	require.NotNil(t, framework)
-	require.IsType(t, new(fakeFramework), framework)
+		framework, err := sm.GetFrameworkService(*mockContext.Context, serviceConfig)
+		require.NoError(t, err)
+		require.NotNil(t, framework)
+		require.IsType(t, new(fakeFramework), framework)
+	})
+
+	t.Run("No project path and has docker tag", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(context.Background())
+		mockContext.Container.MustRegisterNamedTransient("docker", newFakeFramework)
+
+		setupMocksForServiceManager(mockContext)
+		env := environment.New("test")
+		sm := createServiceManager(mockContext, env, ServiceOperationCache{})
+		serviceConfig := createTestServiceConfig("", ServiceTargetFake, ServiceLanguageNone)
+		serviceConfig.Image = osutil.NewExpandableString("nginx")
+
+		framework, err := sm.GetFrameworkService(*mockContext.Context, serviceConfig)
+		require.NoError(t, err)
+		require.NotNil(t, framework)
+		require.IsType(t, new(fakeFramework), framework)
+	})
+
+	t.Run("No project path or docker tag", func(t *testing.T) {
+		mockContext := mocks.NewMockContext(context.Background())
+		mockContext.Container.MustRegisterNamedTransient("docker", newFakeFramework)
+
+		setupMocksForServiceManager(mockContext)
+		env := environment.New("test")
+		sm := createServiceManager(mockContext, env, ServiceOperationCache{})
+		serviceConfig := createTestServiceConfig("", ServiceTargetFake, ServiceLanguageNone)
+
+		_, err := sm.GetFrameworkService(*mockContext.Context, serviceConfig)
+		require.Error(t, err)
+	})
 }
 
 func Test_ServiceManager_GetServiceTarget(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 	serviceTarget, err := sm.GetServiceTarget(*mockContext.Context, serviceConfig)
@@ -236,28 +281,63 @@ func Test_ServiceManager_GetServiceTarget(t *testing.T) {
 func Test_ServiceManager_CacheResults(t *testing.T) {
 	mockContext := mocks.NewMockContext(context.Background())
 	setupMocksForServiceManager(mockContext)
-	env := environment.Ephemeral()
-	sm := createServiceManager(mockContext, env)
+	env := environment.New("test")
+	sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
-	buildCalled := convert.RefOf(false)
+	buildCalled := to.Ptr(false)
 	ctx := context.WithValue(*mockContext.Context, frameworkBuildCalled, buildCalled)
 
-	buildTask1 := sm.Build(ctx, serviceConfig, nil)
-	logProgress(buildTask1)
-
-	buildResult1, _ := buildTask1.Await()
+	buildResult1, _ := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+			return sm.Build(ctx, serviceConfig, nil, progress)
+		},
+	)
 
 	require.True(t, *buildCalled)
 	*buildCalled = false
 
-	buildTask2 := sm.Build(ctx, serviceConfig, nil)
-	logProgress(buildTask1)
-
-	buildResult2, _ := buildTask2.Await()
+	buildResult2, _ := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+			return sm.Build(ctx, serviceConfig, nil, progress)
+		},
+	)
 
 	require.False(t, *buildCalled)
 	require.Same(t, buildResult1, buildResult2)
+}
+
+func Test_ServiceManager_CacheResults_Across_Instances(t *testing.T) {
+	mockContext := mocks.NewMockContext(context.Background())
+	setupMocksForServiceManager(mockContext)
+	env := environment.New("test")
+
+	operationCache := ServiceOperationCache{}
+
+	sm1 := createServiceManager(mockContext, env, operationCache)
+	serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
+
+	packageCalled := to.Ptr(false)
+	ctx := context.WithValue(*mockContext.Context, serviceTargetPackageCalled, packageCalled)
+
+	packageResult1, _ := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+			return sm1.Package(ctx, serviceConfig, nil, progress, nil)
+		},
+	)
+
+	require.True(t, *packageCalled)
+	*packageCalled = false
+
+	sm2 := createServiceManager(mockContext, env, operationCache)
+	packageResult2, _ := logProgress(
+		t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+			return sm2.Package(ctx, serviceConfig, nil, progress, nil)
+		},
+	)
+
+	require.False(t, *packageCalled)
+	require.Same(t, packageResult1, packageResult2)
 }
 
 func Test_ServiceManager_Events_With_Errors(t *testing.T) {
@@ -269,33 +349,37 @@ func Test_ServiceManager_Events_With_Errors(t *testing.T) {
 		{
 			name: "restore",
 			run: func(ctx context.Context, serviceManager ServiceManager, serviceConfig *ServiceConfig) (any, error) {
-				restoreTask := serviceManager.Restore(ctx, serviceConfig)
-				logProgress(restoreTask)
-				return restoreTask.Await()
+				return logProgress(
+					t, func(progess *async.Progress[ServiceProgress]) (*ServiceRestoreResult, error) {
+						return serviceManager.Restore(ctx, serviceConfig, progess)
+					})
 			},
 		},
 		{
 			name: "build",
 			run: func(ctx context.Context, serviceManager ServiceManager, serviceConfig *ServiceConfig) (any, error) {
-				buildTask := serviceManager.Build(ctx, serviceConfig, nil)
-				logProgress(buildTask)
-				return buildTask.Await()
+				return logProgress(
+					t, func(progress *async.Progress[ServiceProgress]) (*ServiceBuildResult, error) {
+						return serviceManager.Build(ctx, serviceConfig, nil, progress)
+					})
 			},
 		},
 		{
 			name: "package",
 			run: func(ctx context.Context, serviceManager ServiceManager, serviceConfig *ServiceConfig) (any, error) {
-				packageTask := serviceManager.Package(ctx, serviceConfig, nil)
-				logProgress(packageTask)
-				return packageTask.Await()
+				return logProgress(
+					t, func(progress *async.Progress[ServiceProgress]) (*ServicePackageResult, error) {
+						return serviceManager.Package(ctx, serviceConfig, nil, progress, nil)
+					})
 			},
 		},
 		{
 			name: "deploy",
 			run: func(ctx context.Context, serviceManager ServiceManager, serviceConfig *ServiceConfig) (any, error) {
-				deployTask := serviceManager.Deploy(ctx, serviceConfig, nil)
-				logProgress(deployTask)
-				return deployTask.Await()
+				return logProgress(
+					t, func(progress *async.Progress[ServiceProgress]) (*ServiceDeployResult, error) {
+						return serviceManager.Deploy(ctx, serviceConfig, nil, progress)
+					})
 			},
 		},
 	}
@@ -304,10 +388,10 @@ func Test_ServiceManager_Events_With_Errors(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			mockContext := mocks.NewMockContext(context.Background())
 			setupMocksForServiceManager(mockContext)
-			env := environment.EphemeralWithValues("test", map[string]string{
+			env := environment.NewWithValues("test", map[string]string{
 				environment.SubscriptionIdEnvVarName: "SUBSCRIPTION_ID",
 			})
-			sm := createServiceManager(mockContext, env)
+			sm := createServiceManager(mockContext, env, ServiceOperationCache{})
 			serviceConfig := createTestServiceConfig("./src/api", ServiceTargetFake, ServiceLanguageFake)
 
 			eventTypes := []string{"pre", "post"}
@@ -331,8 +415,8 @@ func Test_ServiceManager_Events_With_Errors(t *testing.T) {
 }
 
 func setupMocksForServiceManager(mockContext *mocks.MockContext) {
-	_ = mockContext.Container.RegisterNamedSingleton(string(ServiceLanguageFake), newFakeFramework)
-	_ = mockContext.Container.RegisterNamedSingleton(string(ServiceTargetFake), newFakeServiceTarget)
+	mockContext.Container.MustRegisterNamedSingleton(string(ServiceLanguageFake), newFakeFramework)
+	mockContext.Container.MustRegisterNamedSingleton(string(ServiceTargetFake), newFakeServiceTarget)
 
 	mockContext.CommandRunner.When(func(args exec.RunArgs, command string) bool {
 		return strings.Contains(command, "fake-framework restore")
@@ -366,24 +450,24 @@ func setupMocksForServiceManager(mockContext *mocks.MockContext) {
 
 	mockarmresources.AddResourceGroupListMock(mockContext.HttpClient, "SUBSCRIPTION_ID", []*armresources.ResourceGroup{
 		{
-			ID:       convert.RefOf("ID"),
-			Name:     convert.RefOf("RESOURCE_GROUP"),
-			Location: convert.RefOf("eastus2"),
-			Type:     convert.RefOf(string(infra.AzureResourceTypeResourceGroup)),
+			ID:       to.Ptr("ID"),
+			Name:     to.Ptr("RESOURCE_GROUP"),
+			Location: to.Ptr("eastus2"),
+			Type:     to.Ptr(string(azapi.AzureResourceTypeResourceGroup)),
 		},
 	})
 
 	mockarmresources.AddAzResourceListMock(
 		mockContext.HttpClient,
-		convert.RefOf("RESOURCE_GROUP"),
+		to.Ptr("RESOURCE_GROUP"),
 		[]*armresources.GenericResourceExpanded{
 			{
-				ID:       convert.RefOf("ID"),
-				Name:     convert.RefOf("WEB_APP"),
-				Location: convert.RefOf("eastus2"),
-				Type:     convert.RefOf(string(infra.AzureResourceTypeWebSite)),
+				ID:       to.Ptr("ID"),
+				Name:     to.Ptr("WEB_APP"),
+				Location: to.Ptr("eastus2"),
+				Type:     to.Ptr(string(azapi.AzureResourceTypeWebSite)),
 				Tags: map[string]*string{
-					"azd-service-name": convert.RefOf("api"),
+					azure.TagKeyAzdServiceName: to.Ptr("api"),
 				},
 			},
 		},
@@ -410,7 +494,7 @@ func (f *fakeFramework) Requirements() FrameworkRequirements {
 	}
 }
 
-func (f *fakeFramework) RequiredExternalTools(ctx context.Context) []tools.ExternalTool {
+func (f *fakeFramework) RequiredExternalTools(_ context.Context, _ *ServiceConfig) []tools.ExternalTool {
 	return []tools.ExternalTool{&fakeTool{}}
 }
 
@@ -421,74 +505,68 @@ func (f *fakeFramework) Initialize(ctx context.Context, serviceConfig *ServiceCo
 func (f *fakeFramework) Restore(
 	ctx context.Context,
 	serviceConfig *ServiceConfig,
-) *async.TaskWithProgress[*ServiceRestoreResult, ServiceProgress] {
+	_ *async.Progress[ServiceProgress],
+) (*ServiceRestoreResult, error) {
 	restoreCalled, ok := ctx.Value(frameworkRestoreCalled).(*bool)
 	if ok {
 		*restoreCalled = true
 	}
 
-	return async.RunTaskWithProgress(func(task *async.TaskContextWithProgress[*ServiceRestoreResult, ServiceProgress]) {
-		runArgs := exec.NewRunArgs("fake-framework", "restore")
-		result, err := f.commandRunner.Run(ctx, runArgs)
-		if err != nil {
-			task.SetError(err)
-			return
-		}
+	runArgs := exec.NewRunArgs("fake-framework", "restore")
+	result, err := f.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return nil, err
+	}
 
-		task.SetResult(&ServiceRestoreResult{
-			Details: result,
-		})
-	})
+	return &ServiceRestoreResult{
+		Details: result,
+	}, nil
 }
 
 func (f *fakeFramework) Build(
 	ctx context.Context,
 	serviceConfig *ServiceConfig,
 	restoreOutput *ServiceRestoreResult,
-) *async.TaskWithProgress[*ServiceBuildResult, ServiceProgress] {
+	_ *async.Progress[ServiceProgress],
+) (*ServiceBuildResult, error) {
 	buildCalled, ok := ctx.Value(frameworkBuildCalled).(*bool)
 	if ok {
 		*buildCalled = true
 	}
 
-	return async.RunTaskWithProgress(func(task *async.TaskContextWithProgress[*ServiceBuildResult, ServiceProgress]) {
-		runArgs := exec.NewRunArgs("fake-framework", "build")
-		result, err := f.commandRunner.Run(ctx, runArgs)
-		if err != nil {
-			task.SetError(err)
-			return
-		}
+	runArgs := exec.NewRunArgs("fake-framework", "build")
+	result, err := f.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return nil, err
+	}
 
-		task.SetResult(&ServiceBuildResult{
-			Restore: restoreOutput,
-			Details: result,
-		})
-	})
+	return &ServiceBuildResult{
+		Restore: restoreOutput,
+		Details: result,
+	}, nil
 }
 
 func (f *fakeFramework) Package(
 	ctx context.Context,
 	serviceConfig *ServiceConfig,
 	buildOutput *ServiceBuildResult,
-) *async.TaskWithProgress[*ServicePackageResult, ServiceProgress] {
+	_ *async.Progress[ServiceProgress],
+) (*ServicePackageResult, error) {
 	packageCalled, ok := ctx.Value(frameworkPackageCalled).(*bool)
 	if ok {
 		*packageCalled = true
 	}
 
-	return async.RunTaskWithProgress(func(task *async.TaskContextWithProgress[*ServicePackageResult, ServiceProgress]) {
-		runArgs := exec.NewRunArgs("fake-framework", "package")
-		result, err := f.commandRunner.Run(ctx, runArgs)
-		if err != nil {
-			task.SetError(err)
-			return
-		}
+	runArgs := exec.NewRunArgs("fake-framework", "package")
+	result, err := f.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return nil, err
+	}
 
-		task.SetResult(&ServicePackageResult{
-			Build:   buildOutput,
-			Details: result,
-		})
-	})
+	return &ServicePackageResult{
+		Build:   buildOutput,
+		Details: result,
+	}, nil
 }
 
 // Fake implementation of a service target
@@ -506,7 +584,7 @@ func (st *fakeServiceTarget) Initialize(ctx context.Context, serviceConfig *Serv
 	return nil
 }
 
-func (st *fakeServiceTarget) RequiredExternalTools(ctx context.Context) []tools.ExternalTool {
+func (st *fakeServiceTarget) RequiredExternalTools(ctx context.Context, serviceConfig *ServiceConfig) []tools.ExternalTool {
 	return []tools.ExternalTool{&fakeTool{}}
 }
 
@@ -514,25 +592,23 @@ func (st *fakeServiceTarget) Package(
 	ctx context.Context,
 	serviceConfig *ServiceConfig,
 	packageOutput *ServicePackageResult,
-) *async.TaskWithProgress[*ServicePackageResult, ServiceProgress] {
+	progress *async.Progress[ServiceProgress],
+) (*ServicePackageResult, error) {
 	packageCalled, ok := ctx.Value(serviceTargetPackageCalled).(*bool)
 	if ok {
 		*packageCalled = true
 	}
 
-	return async.RunTaskWithProgress(func(task *async.TaskContextWithProgress[*ServicePackageResult, ServiceProgress]) {
-		runArgs := exec.NewRunArgs("fake-service-target", "package")
-		result, err := st.commandRunner.Run(ctx, runArgs)
-		if err != nil {
-			task.SetError(err)
-			return
-		}
+	runArgs := exec.NewRunArgs("fake-service-target", "package")
+	result, err := st.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return nil, err
+	}
 
-		task.SetResult(&ServicePackageResult{
-			Build:   packageOutput.Build,
-			Details: result,
-		})
-	})
+	return &ServicePackageResult{
+		Build:   packageOutput.Build,
+		Details: result,
+	}, nil
 }
 
 func (st *fakeServiceTarget) Deploy(
@@ -540,25 +616,23 @@ func (st *fakeServiceTarget) Deploy(
 	serviceConfig *ServiceConfig,
 	packageOutput *ServicePackageResult,
 	targetResource *environment.TargetResource,
-) *async.TaskWithProgress[*ServiceDeployResult, ServiceProgress] {
+	progress *async.Progress[ServiceProgress],
+) (*ServiceDeployResult, error) {
 	deployCalled, ok := ctx.Value(serviceTargetDeployCalled).(*bool)
 	if ok {
 		*deployCalled = true
 	}
 
-	return async.RunTaskWithProgress(func(task *async.TaskContextWithProgress[*ServiceDeployResult, ServiceProgress]) {
-		runArgs := exec.NewRunArgs("fake-service-target", "deploy")
-		result, err := st.commandRunner.Run(ctx, runArgs)
-		if err != nil {
-			task.SetError(err)
-			return
-		}
+	runArgs := exec.NewRunArgs("fake-service-target", "deploy")
+	result, err := st.commandRunner.Run(ctx, runArgs)
+	if err != nil {
+		return nil, err
+	}
 
-		task.SetResult(&ServiceDeployResult{
-			Package: packageOutput,
-			Details: result,
-		})
-	})
+	return &ServiceDeployResult{
+		Package: packageOutput,
+		Details: result,
+	}, nil
 }
 
 func (st *fakeServiceTarget) Endpoints(
@@ -572,8 +646,8 @@ func (st *fakeServiceTarget) Endpoints(
 type fakeTool struct {
 }
 
-func (t *fakeTool) CheckInstalled(ctx context.Context) (bool, error) {
-	return true, nil
+func (t *fakeTool) CheckInstalled(ctx context.Context) error {
+	return nil
 }
 func (t *fakeTool) InstallUrl() string {
 	return "https://aka.ms"
