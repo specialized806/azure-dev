@@ -7,7 +7,32 @@ import (
 	"testing"
 
 	"azureaiagent/internal/project"
+
+	"github.com/azure/azure-dev/cli/azd/pkg/azdext"
 )
+
+// TestPostdeployHandler_NoAgentService_NoOp verifies postdeployHandler returns nil
+// without any RPC calls when the project has no hosted agent services. Regression
+// guard for #7373.
+func TestPostdeployHandler_NoAgentService_NoOp(t *testing.T) {
+	t.Parallel()
+
+	// Use a temp dir + explicit RelativePath so isHostedAgentService deterministically
+	// returns false (no agent.yaml present) regardless of the test working directory.
+	args := &azdext.ProjectEventArgs{
+		Project: &azdext.ProjectConfig{
+			Path: t.TempDir(),
+			Services: map[string]*azdext.ServiceConfig{
+				"teams-bot": {Name: "teams-bot", Host: "containerapp", RelativePath: "."},
+			},
+		},
+	}
+
+	// nil azdClient — the early return must fire before any RPC call.
+	if err := postdeployHandler(t.Context(), nil, args); err != nil {
+		t.Fatalf("expected no error for project without agent services, got: %v", err)
+	}
+}
 
 func TestParseConnectionIDs(t *testing.T) {
 	t.Parallel()
