@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	syncatomic "sync/atomic"
 	"syscall"
 	"time"
 
@@ -59,6 +60,14 @@ type ShowPreviewerOptions struct {
 	Prefix       string
 	MaxLineCount int
 	Title        string
+}
+
+// PreviewerPauser is an optional interface that Console implementations
+// may support. When the progress table is active, callers can pause
+// previewer output to prevent terminal corruption.
+type PreviewerPauser interface {
+	PausePreviewer()
+	ResumePreviewer()
 }
 
 type PromptDialog struct {
@@ -165,7 +174,9 @@ type AskerConsole struct {
 	spinnerTerminalMode yacspin.TerminalMode
 	spinnerCurrentTitle string
 
-	previewer *progressLog
+	previewer           syncatomic.Pointer[progressLog]
+	previewerRefCount   int // tracks concurrent ShowPreviewer callers; only stop when it reaches 0
+	previewerSuppressed syncatomic.Bool
 
 	currentIndent *atomic.String
 	// consoleWidth is the width of the underlying console window. The value is updated as the window resized. Nil when
@@ -331,18 +342,35 @@ func defaultShowPreviewerOptions() *ShowPreviewerOptions {
 }
 
 func (c *AskerConsole) ShowPreviewer(ctx context.Context, options *ShowPreviewerOptions) io.Writer {
+	if c.previewerSuppressed.Load() {
+		log.Printf("ShowPreviewer suppressed — progress table active")
+		return io.Discard
+	}
+
 	c.showProgressMu.Lock()
 	defer c.showProgressMu.Unlock()
 
+	if c.previewer.Load() != nil {
+		// Previewer already active from a concurrent caller (e.g. concurrent graph steps).
+		// Reuse the existing previewer and increment the reference count so that
+		// StopPreviewer only tears it down when the last user is done.
+		c.previewerRefCount++
+		return &consolePreviewerWriter{
+			previewer: &c.previewer,
+		}
+	}
+
 	// Pause any active spinner
+	c.spinnerLineMu.Lock()
 	currentMsg := c.spinnerCurrentTitle
+	c.spinnerLineMu.Unlock()
 	_ = c.spinner.Pause()
 
 	if options == nil {
 		options = defaultShowPreviewerOptions()
 	}
 
-	c.previewer = newProgressLogWithWidthFn(
+	p := newProgressLogWithWidthFn(
 		options.MaxLineCount,
 		options.Prefix,
 		options.Title,
@@ -354,19 +382,51 @@ func (c *AskerConsole) ShowPreviewer(ctx context.Context, options *ShowPreviewer
 
 			return int(c.consoleWidth.Load())
 		})
-	c.previewer.Start()
-	c.writer = c.previewer
+	p.Start()
+	c.previewer.Store(p)
+	c.writer = p
+	c.previewerRefCount = 1
 	return &consolePreviewerWriter{
 		previewer: &c.previewer,
 	}
 }
 
 func (c *AskerConsole) StopPreviewer(ctx context.Context, keepLogs bool) {
-	c.previewer.Stop(keepLogs)
-	c.previewer = nil
+	if c.previewerSuppressed.Load() {
+		return
+	}
+
+	c.showProgressMu.Lock()
+	defer c.showProgressMu.Unlock()
+
+	if c.previewerRefCount <= 0 {
+		// Already fully stopped or never started. No-op.
+		return
+	}
+
+	c.previewerRefCount--
+	if c.previewerRefCount > 0 {
+		// Other concurrent callers are still using the previewer.
+		return
+	}
+
+	c.previewer.Load().Stop(keepLogs)
+	c.previewer.Store(nil)
 	c.writer = c.defaultWriter
 
 	_ = c.spinner.Unpause()
+}
+
+// PausePreviewer prevents ShowPreviewer from rendering until ResumePreviewer
+// is called. Use this when a progress table owns the terminal output and previewer
+// content would corrupt the display.
+func (c *AskerConsole) PausePreviewer() {
+	c.previewerSuppressed.Store(true)
+}
+
+// ResumePreviewer re-enables previewer rendering.
+func (c *AskerConsole) ResumePreviewer() {
+	c.previewerSuppressed.Store(false)
 }
 
 // truncationDots is the text we use to indicate that text has been truncated.
@@ -429,9 +489,9 @@ func (c *AskerConsole) ShowSpinner(ctx context.Context, title string, format Spi
 		return
 	}
 
-	if c.previewer != nil {
+	if p := c.previewer.Load(); p != nil {
 		// spinner is not compatible with previewer.
-		c.previewer.Header(c.currentIndent.Load() + title)
+		p.Header(c.currentIndent.Load() + title)
 		return
 	}
 
